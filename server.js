@@ -28,7 +28,7 @@ function isMutualMatch(userA, userB) {
   return wantsA && wantsB;
 }
 
-io.on('connection', (socket) => {
+io.on('connect', (socket) => {
   console.log('User connected:', socket.id);
 
   // User joins and searches
