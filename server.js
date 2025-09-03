@@ -8,7 +8,7 @@ const io = socketIo(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Queues for different preference combinations
+// Queues for preferences
 const queues = {
   'male-any': [],
   'female-any': [],
@@ -21,51 +21,41 @@ const queues = {
 const users = new Map();
 const rooms = new Map();
 
+// ✅ Helper: check if both sides accept each other
+function isMutualMatch(userA, userB) {
+  const wantsB = (userA.preference === "any" || userA.preference === userB.gender);
+  const wantsA = (userB.preference === "any" || userB.preference === userA.gender);
+  return wantsA && wantsB;
+}
+
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // Unified join + find event
+  // User joins and searches
   socket.on('join_and_find', (data) => {
     const { userId, name, gender, preference } = data;
 
     // Save user
-    const user = { userId, name, gender, socketId: socket.id };
+    const user = { userId, name, gender, preference, socketId: socket.id };
     users.set(socket.id, user);
 
-    // Create queue key
-    const queueKey = `${gender}-${preference}`;
     let matchedUser = null;
 
-    if (preference === 'any') {
-      // Look for anyone waiting for this gender
-      const checkQueues = [
-        `male-${gender}`,
-        `female-${gender}`,
-        `${gender === 'male' ? 'female' : 'male'}-any`
-      ];
-
-      for (let qKey of checkQueues) {
-        if (queues[qKey] && queues[qKey].length > 0) {
-          matchedUser = queues[qKey].shift();
+    // Try to find a match from all queues
+    for (const [qKey, qUsers] of Object.entries(queues)) {
+      if (qUsers.length > 0) {
+        const candidate = qUsers.find(u => isMutualMatch(user, u));
+        if (candidate) {
+          matchedUser = candidate;
+          queues[qKey] = qUsers.filter(u => u.socketId !== candidate.socketId);
           break;
         }
-      }
-    } else {
-      // Check exact preference or "any"
-      const reverseQueueKey = `${preference}-${gender}`;
-      const anyQueueKey = `${preference}-any`;
-
-      if (queues[reverseQueueKey] && queues[reverseQueueKey].length > 0) {
-        matchedUser = queues[reverseQueueKey].shift();
-      } else if (queues[anyQueueKey] && queues[anyQueueKey].length > 0) {
-        matchedUser = queues[anyQueueKey].shift();
       }
     }
 
     if (matchedUser) {
       // ✅ Match found
       const roomId = `room_${Date.now()}`;
-
       socket.join(roomId);
       io.sockets.sockets.get(matchedUser.socketId)?.join(roomId);
 
@@ -74,7 +64,7 @@ io.on('connection', (socket) => {
         createdAt: new Date()
       });
 
-      // Notify both users with unified "status"
+      // Notify both
       socket.emit('status', {
         state: 'match_found',
         roomId,
@@ -88,26 +78,20 @@ io.on('connection', (socket) => {
       });
 
     } else {
-      // ❌ No match yet → enqueue
+      // ❌ No match found → push into queue
+      const queueKey = `${gender}-${preference}`;
       if (!queues[queueKey]) queues[queueKey] = [];
-      queues[queueKey].push({
-        userId,
-        name,
-        gender,
-        socketId: socket.id,
-        joinedAt: Date.now()
-      });
+      queues[queueKey].push(user);
 
       socket.emit('status', {
         state: 'searching',
         message: 'Searching for a partner...'
       });
 
-      // Optional timeout (e.g., 60 sec)
+      // Timeout after 60 seconds
       setTimeout(() => {
         const stillWaiting = queues[queueKey].some(u => u.socketId === socket.id);
         if (stillWaiting) {
-          // Remove from queue
           queues[queueKey] = queues[queueKey].filter(u => u.socketId !== socket.id);
           socket.emit('status', {
             state: 'timeout',
