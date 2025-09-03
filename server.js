@@ -24,7 +24,7 @@ const rooms = new Map();
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // NEW event: user joins and searches at once
+  // Unified join + find event
   socket.on('join_and_find', (data) => {
     const { userId, name, gender, preference } = data;
 
@@ -32,12 +32,12 @@ io.on('connection', (socket) => {
     const user = { userId, name, gender, socketId: socket.id };
     users.set(socket.id, user);
 
-    // Create queue key for this user
+    // Create queue key
     const queueKey = `${gender}-${preference}`;
     let matchedUser = null;
 
     if (preference === 'any') {
-      // Check opposite gender specific queues first
+      // Look for anyone waiting for this gender
       const checkQueues = [
         `male-${gender}`,
         `female-${gender}`,
@@ -51,7 +51,7 @@ io.on('connection', (socket) => {
         }
       }
     } else {
-      // Exact match first
+      // Check exact preference or "any"
       const reverseQueueKey = `${preference}-${gender}`;
       const anyQueueKey = `${preference}-any`;
 
@@ -74,19 +74,21 @@ io.on('connection', (socket) => {
         createdAt: new Date()
       });
 
-      // Notify both users
-      socket.emit('match_found', {
+      // Notify both users with unified "status"
+      socket.emit('status', {
+        state: 'match_found',
         roomId,
         matchedUser
       });
 
-      io.to(matchedUser.socketId).emit('match_found', {
+      io.to(matchedUser.socketId).emit('status', {
+        state: 'match_found',
         roomId,
         matchedUser: user
       });
 
     } else {
-      // ❌ No match found → push to queue
+      // ❌ No match yet → enqueue
       if (!queues[queueKey]) queues[queueKey] = [];
       queues[queueKey].push({
         userId,
@@ -96,7 +98,23 @@ io.on('connection', (socket) => {
         joinedAt: Date.now()
       });
 
-      socket.emit('waiting_for_match', { message: 'Searching...' });
+      socket.emit('status', {
+        state: 'searching',
+        message: 'Searching for a partner...'
+      });
+
+      // Optional timeout (e.g., 60 sec)
+      setTimeout(() => {
+        const stillWaiting = queues[queueKey].some(u => u.socketId === socket.id);
+        if (stillWaiting) {
+          // Remove from queue
+          queues[queueKey] = queues[queueKey].filter(u => u.socketId !== socket.id);
+          socket.emit('status', {
+            state: 'timeout',
+            message: 'No match found. Please try again.'
+          });
+        }
+      }, 60000);
     }
   });
 
@@ -105,7 +123,7 @@ io.on('connection', (socket) => {
     Object.keys(queues).forEach(key => {
       queues[key] = queues[key].filter(u => u.socketId !== socket.id);
     });
-    socket.emit('search_cancelled', { message: 'Search cancelled' });
+    socket.emit('status', { state: 'cancelled', message: 'Search cancelled' });
   });
 
   // Disconnect cleanup
