@@ -94,17 +94,18 @@ io.on("connection", (socket) => {
         }
       };
 
-      socket.emit("status", statusDataForCurrent);
-      io.to(matchedUser.socketId).emit("status", statusDataForMatched);
+      // stringify before emitting
+      socket.emit("status", JSON.stringify(statusDataForCurrent));
+      io.to(matchedUser.socketId).emit("status", JSON.stringify(statusDataForMatched));
     } else {
       // ❌ No match found → push to queue
       if (!queues[queueKey]) queues[queueKey] = [];
       queues[queueKey].push(user);
 
-      socket.emit("status", {
+      socket.emit("status", JSON.stringify({
         state: "searching",
         message: "Searching for a partner..."
-      });
+      }));
     }
   });
 
@@ -113,10 +114,10 @@ io.on("connection", (socket) => {
     Object.keys(queues).forEach((key) => {
       queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
     });
-    socket.emit("status", {
+    socket.emit("status", JSON.stringify({
       state: "cancelled",
       message: "Search cancelled."
-    });
+    }));
   });
 
   // Handle disconnect
@@ -125,11 +126,11 @@ io.on("connection", (socket) => {
     Object.keys(queues).forEach((key) => {
       queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
     });
-    io.emit("status", {
+    io.emit("status", JSON.stringify({
       state: "disconnected",
       message: "A user disconnected",
       socketId: socket.id
-    });
+    }));
     console.log("User disconnected:", socket.id);
   });
 });
