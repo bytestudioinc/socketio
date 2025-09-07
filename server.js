@@ -20,7 +20,7 @@ const queues = {
 
 const users = new Map();   // socket.id -> user
 const rooms = new Map();   // roomId -> {users: [socketIds]}
-const timeouts = new Map(); // socket.id -> timeoutId
+const searchTimeouts = new Map(); // socket.id -> timeoutId
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
@@ -48,33 +48,34 @@ io.on("connection", (socket) => {
           ) {
             matchedUser = candidate;
             queues[qKey].splice(i, 1);
-            clearTimeout(timeouts.get(candidate.socketId));
-            timeouts.delete(candidate.socketId);
             break;
           }
         }
         if (matchedUser) break;
       }
     } else {
+      // Look for exact or compatible match
       const reverseQueueKey = `${preference}-${gender}`;
       const anyQueueKey = `${preference}-any`;
 
-      if (queues[reverseQueueKey] && queues[reverseQueueKey].length > 0) {
+      if (queues[reverseQueueKey]?.length > 0) {
         matchedUser = queues[reverseQueueKey].shift();
-        clearTimeout(timeouts.get(matchedUser.socketId));
-        timeouts.delete(matchedUser.socketId);
-      } else if (queues[anyQueueKey] && queues[anyQueueKey].length > 0) {
+      } else if (queues[anyQueueKey]?.length > 0) {
         matchedUser = queues[anyQueueKey].shift();
-        clearTimeout(timeouts.get(matchedUser.socketId));
-        timeouts.delete(matchedUser.socketId);
       }
     }
 
     if (matchedUser) {
       // ✅ Match found
       const roomId = `room_${Date.now()}`;
+
+      // Get matched user's socket safely (works in v2 & v3+)
+      const matchedSocket = io.sockets.sockets.get
+        ? io.sockets.sockets.get(matchedUser.socketId) // v3+
+        : io.sockets.sockets[matchedUser.socketId];    // v2
+
       socket.join(roomId);
-      io.sockets.sockets.get(matchedUser.socketId)?.join(roomId);
+      matchedSocket?.join(roomId);
       rooms.set(roomId, { users: [socket.id, matchedUser.socketId] });
 
       const statusDataForCurrent = {
@@ -99,32 +100,40 @@ io.on("connection", (socket) => {
         }
       };
 
-      socket.emit("status", JSON.stringify(statusDataForCurrent));
-      io.to(matchedUser.socketId).emit("status", JSON.stringify(statusDataForMatched));
+      socket.emit("status", statusDataForCurrent);
+      matchedSocket?.emit("status", statusDataForMatched);
+
+      // Clear timeout if any
+      clearTimeout(searchTimeouts.get(socket.id));
+      clearTimeout(searchTimeouts.get(matchedUser.socketId));
+      searchTimeouts.delete(socket.id);
+      searchTimeouts.delete(matchedUser.socketId);
+
     } else {
-      // ❌ No match found → push to queue
+      // ❌ No match → push to queue
       if (!queues[queueKey]) queues[queueKey] = [];
       queues[queueKey].push(user);
 
-      socket.emit("status", JSON.stringify({
+      socket.emit("status", {
         state: "searching",
         message: "Searching for a partner..."
-      }));
+      });
 
-      // start timeout (30s)
+      // ⏳ Set timeout (30s)
       const timeoutId = setTimeout(() => {
-        // Remove from queue if still there
+        // Remove from queue if still unmatched
         Object.keys(queues).forEach((key) => {
           queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
         });
-        socket.emit("status", JSON.stringify({
+
+        socket.emit("status", {
           state: "timeout",
           message: "Couldn't find a match. Please try again."
-        }));
-        timeouts.delete(socket.id);
-      }, 30000); // 30,000ms = 30 seconds (change to 60000 for 1 min)
+        });
+        searchTimeouts.delete(socket.id);
+      }, 30000);
 
-      timeouts.set(socket.id, timeoutId);
+      searchTimeouts.set(socket.id, timeoutId);
     }
   });
 
@@ -133,12 +142,13 @@ io.on("connection", (socket) => {
     Object.keys(queues).forEach((key) => {
       queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
     });
-    clearTimeout(timeouts.get(socket.id));
-    timeouts.delete(socket.id);
-    socket.emit("status", JSON.stringify({
+    clearTimeout(searchTimeouts.get(socket.id));
+    searchTimeouts.delete(socket.id);
+
+    socket.emit("status", {
       state: "cancelled",
       message: "Search cancelled."
-    }));
+    });
   });
 
   // Handle disconnect
@@ -147,13 +157,14 @@ io.on("connection", (socket) => {
     Object.keys(queues).forEach((key) => {
       queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
     });
-    clearTimeout(timeouts.get(socket.id));
-    timeouts.delete(socket.id);
-    io.emit("status", JSON.stringify({
+    clearTimeout(searchTimeouts.get(socket.id));
+    searchTimeouts.delete(socket.id);
+
+    io.emit("status", {
       state: "disconnected",
       message: "A user disconnected",
       socketId: socket.id
-    }));
+    });
     console.log("User disconnected:", socket.id);
   });
 });
