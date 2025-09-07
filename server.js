@@ -6,7 +6,7 @@ const server = http.createServer(app);
 
 let io;
 
-// Socket.IO v4/v2 detection
+// Detect Socket.IO v4 or fallback to v2
 try {
   const { Server } = require("socket.io");
   io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
@@ -19,16 +19,18 @@ try {
 
 const PORT = process.env.PORT || 10000;
 
-// Map of users searching for match
+// Users searching for match: socketId -> user info
 let searchingUsers = new Map();
+// Rooms: roomId -> [socketIds]
+let rooms = new Map();
 
-// Helper to get socket object safely (v2/v4)
+// Get socket safely (v2/v4)
 function getSocketById(socketId) {
-  if (io.sockets.sockets.get) return io.sockets.sockets.get(socketId); // v4
-  return io.sockets.connected[socketId]; // v2
+  if (io.sockets.sockets.get) return io.sockets.sockets.get(socketId);
+  return io.sockets.connected[socketId];
 }
 
-// Helper to send safe partner info without _timeout
+// Remove internal _timeout before sending partner info
 function getSafeUser(user) {
   return {
     userId: user.userId,
@@ -41,24 +43,14 @@ function getSafeUser(user) {
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
-  // Universal logger for debugging
-  const oldOn = socket.on;
-  socket.on = function (event, listener) {
-    oldOn.call(this, event, (data) => {
-      console.log(`📩 Event from ${socket.id} =>`, event, data, "Type:", typeof data);
-      listener(data);
-    });
-  };
-
-  // Handle find match
+  // ---------------- Matchmaking ----------------
   socket.on("find", (data) => {
     let parsedData = data;
-
     if (typeof data === "string") {
       try {
         parsedData = JSON.parse(data);
       } catch (err) {
-        console.error("❌ Invalid JSON from client:", err.message);
+        console.error("❌ Invalid JSON:", err.message);
         socket.emit("status", JSON.stringify({ state: "error", message: "Invalid data format" }));
         return;
       }
@@ -66,7 +58,7 @@ io.on("connection", (socket) => {
 
     parsedData.socketId = socket.id;
 
-    // Check if there is someone already searching
+    // Look for any available match
     let matched = null;
     for (let [otherId, otherUser] of searchingUsers) {
       if (otherId !== socket.id) {
@@ -83,18 +75,19 @@ io.on("connection", (socket) => {
       const matchedSocket = getSocketById(matched.socketId);
       if (matchedSocket) matchedSocket.join(roomId);
 
-      // Emit safe JSON to both users
+      rooms.set(roomId, [socket.id, matched.socketId]);
+
+      // Send match info to both users
       socket.emit("status", JSON.stringify({ state: "matched", roomId, partner: getSafeUser(matched) }));
       matchedSocket?.emit("status", JSON.stringify({ state: "matched", roomId, partner: getSafeUser(parsedData) }));
 
-      // Remove users from searching pool
       searchingUsers.delete(socket.id);
       searchingUsers.delete(matched.socketId);
     } else {
       // No match → add to pool with 30s timeout
       const timeout = setTimeout(() => {
         if (searchingUsers.has(socket.id)) {
-          console.log(`⏰ Timeout: Couldn't find match for ${socket.id}`);
+          console.log(`⏰ Timeout for ${socket.id}`);
           socket.emit("status", JSON.stringify({ state: "timeout", message: "Couldn't find a match" }));
           searchingUsers.delete(socket.id);
         }
@@ -102,7 +95,6 @@ io.on("connection", (socket) => {
 
       parsedData._timeout = timeout;
       searchingUsers.set(socket.id, parsedData);
-
       socket.emit("status", JSON.stringify({ state: "searching", message: "Searching for a partner..." }));
     }
   });
@@ -118,13 +110,76 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Disconnect
+  // ---------------- Chat Messaging ----------------
+  // Sending message: { roomId, name, gender, type, message, time }
+  socket.on("chat_message", (data) => {
+    let parsedData = data;
+    if (typeof data === "string") {
+      try {
+        parsedData = JSON.parse(data);
+      } catch (err) {
+        console.error("❌ Invalid chat JSON:", err.message);
+        return;
+      }
+    }
+
+    const { roomId, message, type, name, gender, time } = parsedData;
+    if (!roomId || !message || !type) return;
+
+    if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
+      // Emit message to everyone in the room except sender
+      socket.to(roomId).emit("chat_response", JSON.stringify({
+        from: socket.id,
+        name,
+        gender,
+        type,
+        message,
+        time
+      }));
+      console.log(`💬 Message from ${socket.id} in ${roomId}: ${message}`);
+    } else {
+      console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
+    }
+  });
+
+  // ---------------- Leave Chat ----------------
+  socket.on("leave_chat", (data) => {
+    let parsedData = data;
+    if (typeof data === "string") {
+      try { parsedData = JSON.parse(data); } 
+      catch { return; }
+    }
+    const { roomId } = parsedData;
+    if (!roomId || !rooms.has(roomId)) return;
+
+    const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
+    otherUsers.forEach(id => {
+      const s = getSocketById(id);
+      s?.emit("status", JSON.stringify({ state: "partner_disconnected", message: "Your partner left the chat." }));
+    });
+
+    socket.leave(roomId);
+    rooms.delete(roomId);
+    console.log(`🚪 ${socket.id} left room ${roomId}`);
+  });
+
+  // ---------------- Disconnect ----------------
   socket.on("disconnect", () => {
     console.log(`❌ User disconnected: ${socket.id}`);
+
+    // Remove from searching pool
     if (searchingUsers.has(socket.id)) {
       const user = searchingUsers.get(socket.id);
       if (user._timeout) clearTimeout(user._timeout);
       searchingUsers.delete(socket.id);
+    }
+
+    // Remove user from rooms
+    for (let [roomId, sockets] of rooms) {
+      if (sockets.includes(socket.id)) {
+        rooms.delete(roomId);
+        socket.to(roomId).emit("status", JSON.stringify({ state: "partner_disconnected", message: "Your partner left the chat." }));
+      }
     }
   });
 });
