@@ -1,190 +1,240 @@
-// server.js
 const express = require("express");
 const http = require("http");
+const socketIo = require("socket.io");
+
 const app = express();
 const server = http.createServer(app);
 
+// Handle different socket.io versions
 let io;
-
-// Detect Socket.IO v4 or fallback to v2
 try {
-  const { Server } = require("socket.io");
-  io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-  console.log("✅ Using Socket.IO v3/v4");
+  const { Server } = require("socket.io"); // v3/v4
+  io = new Server(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+  });
 } catch (e) {
-  const socketIo = require("socket.io");
-  io = socketIo(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-  console.log("✅ Using Socket.IO v2");
+  io = require("socket.io")(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] }
+  }); // v2 fallback
 }
 
-const PORT = process.env.PORT || 10000;
+// Queues and maps
+const queues = {
+  "male-any": [],
+  "female-any": [],
+  "male-male": [],
+  "male-female": [],
+  "female-male": [],
+  "female-female": []
+};
 
-// Users searching for match: socketId -> user info
-let searchingUsers = new Map();
-// Rooms: roomId -> [socketIds]
-let rooms = new Map();
-
-// Get socket safely (v2/v4)
-function getSocketById(socketId) {
-  if (io.sockets.sockets.get) return io.sockets.sockets.get(socketId);
-  return io.sockets.connected[socketId];
-}
-
-// Remove internal _timeout before sending partner info
-function getSafeUser(user) {
-  return {
-    userId: user.userId,
-    name: user.name,
-    gender: user.gender,
-    preference: user.preference
-  };
-}
+const users = new Map();   // socket.id -> user
+const rooms = new Map();   // roomId -> { users: [socketIds] }
+const timeouts = new Map();// socket.id -> timeoutId
 
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
-  // ---------------- Matchmaking ----------------
-  socket.on("find", (data) => {
-    let parsedData = data;
-    if (typeof data === "string") {
-      try {
-        parsedData = JSON.parse(data);
-      } catch (err) {
-        console.error("❌ Invalid JSON:", err.message);
-        socket.emit("status", JSON.stringify({ state: "error", message: "Invalid data format" }));
-        return;
-      }
+  // --- Matchmaking event ---
+  socket.on("find", (rawData) => {
+    console.log(`📩 Find event from ${socket.id} =>`, rawData, "Type:", typeof rawData);
+
+    let data;
+    try {
+      data = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
+    } catch (err) {
+      console.error("❌ Invalid JSON from client:", rawData);
+      return;
     }
 
-    parsedData.socketId = socket.id;
+    const { userId, name, gender, preference } = data;
+    const user = { userId, name, gender, preference, socketId: socket.id };
+    users.set(socket.id, user);
 
-    // Look for any available match
-    let matched = null;
-    for (let [otherId, otherUser] of searchingUsers) {
-      if (otherId !== socket.id) {
-        matched = otherUser;
-        break;
-      }
-    }
+    const queueKey = `${gender}-${preference}`;
+    let matchedUser = null;
 
-    if (matched) {
-      const roomId = `room_${socket.id}_${matched.socketId}`;
-      console.log(`🎯 Match found: ${socket.id} + ${matched.socketId}`);
-
-      socket.join(roomId);
-      const matchedSocket = getSocketById(matched.socketId);
-      if (matchedSocket) matchedSocket.join(roomId);
-
-      rooms.set(roomId, [socket.id, matched.socketId]);
-
-      // Send match info to both users
-      socket.emit("status", JSON.stringify({ state: "matched", roomId, partner: getSafeUser(matched) }));
-      matchedSocket?.emit("status", JSON.stringify({ state: "matched", roomId, partner: getSafeUser(parsedData) }));
-
-      searchingUsers.delete(socket.id);
-      searchingUsers.delete(matched.socketId);
-    } else {
-      // No match → add to pool with 30s timeout
-      const timeout = setTimeout(() => {
-        if (searchingUsers.has(socket.id)) {
-          console.log(`⏰ Timeout for ${socket.id}`);
-          socket.emit("status", JSON.stringify({ state: "timeout", message: "Couldn't find a match" }));
-          searchingUsers.delete(socket.id);
+    if (preference === "any") {
+      const checkQueues = ["male-any", "female-any"];
+      for (let qKey of checkQueues) {
+        for (let i = 0; i < queues[qKey].length; i++) {
+          const candidate = queues[qKey][i];
+          if (candidate.preference === "any" || candidate.preference === gender) {
+            matchedUser = candidate;
+            queues[qKey].splice(i, 1);
+            break;
+          }
         }
+        if (matchedUser) break;
+      }
+    } else {
+      const reverseQueueKey = `${preference}-${gender}`;
+      const anyQueueKey = `${preference}-any`;
+
+      if (queues[reverseQueueKey]?.length > 0) {
+        matchedUser = queues[reverseQueueKey].shift();
+      } else if (queues[anyQueueKey]?.length > 0) {
+        matchedUser = queues[anyQueueKey].shift();
+      }
+    }
+
+    if (matchedUser) {
+      const roomId = `room_${Date.now()}`;
+      socket.join(roomId);
+
+      const matchedSocket = io.sockets.sockets.get
+        ? io.sockets.sockets.get(matchedUser.socketId) // v3+
+        : io.sockets.connected[matchedUser.socketId];  // v2
+
+      matchedSocket?.join(roomId);
+      rooms.set(roomId, { users: [socket.id, matchedUser.socketId] });
+
+      const statusDataForCurrent = {
+        state: "match_found",
+        message: "Partner found!",
+        roomId,
+        matchedUser: {
+          userId: matchedUser.userId,
+          name: matchedUser.name,
+          gender: matchedUser.gender
+        }
+      };
+
+      const statusDataForMatched = {
+        state: "match_found",
+        message: "Partner found!",
+        roomId,
+        matchedUser: {
+          userId: user.userId,
+          name: user.name,
+          gender: user.gender
+        }
+      };
+
+      console.log(`🤝 Match found! Room: ${roomId}, Users: ${socket.id}, ${matchedUser.socketId}`);
+      socket.emit("status", statusDataForCurrent);
+      matchedSocket?.emit("status", statusDataForMatched);
+    } else {
+      if (!queues[queueKey]) queues[queueKey] = [];
+      queues[queueKey].push(user);
+
+      console.log(`⌛ User ${socket.id} added to queue ${queueKey}`);
+
+      socket.emit("status", {
+        state: "searching",
+        message: "Searching for a partner..."
+      });
+
+      const timeoutId = setTimeout(() => {
+        console.log(`⏰ Timeout for user ${socket.id}`);
+        socket.emit("status", {
+          state: "timeout",
+          message: "Couldn't find a match."
+        });
+        Object.keys(queues).forEach(
+          (key) => (queues[key] = queues[key].filter((u) => u.socketId !== socket.id))
+        );
       }, 30000);
 
-      parsedData._timeout = timeout;
-      searchingUsers.set(socket.id, parsedData);
-      socket.emit("status", JSON.stringify({ state: "searching", message: "Searching for a partner..." }));
+      timeouts.set(socket.id, timeoutId);
     }
   });
 
-  // Cancel search
-  socket.on("cancel_search", () => {
-    if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
-      searchingUsers.delete(socket.id);
-      socket.emit("status", JSON.stringify({ state: "cancelled", message: "Search cancelled." }));
-      console.log(`🚫 Search cancelled by ${socket.id}`);
-    }
-  });
+  // --- Chat message event ---
+  socket.on("chat_message", (rawData) => {
+    console.log(`📩 Chat_message from ${socket.id} =>`, rawData, "Type:", typeof rawData);
 
-  // ---------------- Chat Messaging ----------------
-  // Sending message: { roomId, name, gender, type, message, time }
-  socket.on("chat_message", (data) => {
-    let parsedData = data;
-    if (typeof data === "string") {
-      try {
-        parsedData = JSON.parse(data);
-      } catch (err) {
-        console.error("❌ Invalid chat JSON:", err.message);
-        return;
-      }
+    let data;
+    try {
+      data = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
+    } catch (err) {
+      console.error("❌ Invalid JSON in chat_message:", rawData);
+      return;
     }
 
-    const { roomId, message, type, name, gender, time } = parsedData;
-    if (!roomId || !message || !type) return;
+    const { roomId, userId, name, gender, msgType, content, time } = data;
+    console.log(`💬 User ${socket.id} sending to Room ${roomId}:`, data);
 
-    if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
-      // Emit message to everyone in the room except sender
-      socket.to(roomId).emit("chat_response", JSON.stringify({
-        from: socket.id,
-        name,
-        gender,
-        type,
-        message,
-        time
-      }));
-      console.log(`💬 Message from ${socket.id} in ${roomId}: ${message}`);
-    } else {
-      console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
-    }
-  });
-
-  // ---------------- Leave Chat ----------------
-  socket.on("leave_chat", (data) => {
-    let parsedData = data;
-    if (typeof data === "string") {
-      try { parsedData = JSON.parse(data); } 
-      catch { return; }
-    }
-    const { roomId } = parsedData;
-    if (!roomId || !rooms.has(roomId)) return;
-
-    const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
-    otherUsers.forEach(id => {
-      const s = getSocketById(id);
-      s?.emit("status", JSON.stringify({ state: "partner_disconnected", message: "Your partner left the chat." }));
+    // Emit to others in the same room
+    socket.to(roomId).emit("chat_response", {
+      userId,
+      name,
+      gender,
+      msgType,
+      content,
+      time
     });
+  });
+
+  // --- Cancel search ---
+  socket.on("cancel_search", () => {
+    clearTimeout(timeouts.get(socket.id));
+    timeouts.delete(socket.id);
+
+    Object.keys(queues).forEach((key) => {
+      queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
+    });
+    console.log(`❌ Search cancelled for ${socket.id}`);
+
+    socket.emit("status", {
+      state: "cancelled",
+      message: "Search cancelled."
+    });
+  });
+
+  // --- Leave chat ---
+  socket.on("leave_chat", ({ roomId }) => {
+    console.log(`👋 User ${socket.id} leaving room ${roomId}`);
 
     socket.leave(roomId);
-    rooms.delete(roomId);
-    console.log(`🚪 ${socket.id} left room ${roomId}`);
+
+    if (rooms.has(roomId)) {
+      const partners = rooms.get(roomId).users.filter((id) => id !== socket.id);
+      partners.forEach((partnerId) => {
+        const partnerSocket = io.sockets.sockets.get
+          ? io.sockets.sockets.get(partnerId)
+          : io.sockets.connected[partnerId];
+        partnerSocket?.emit("status", {
+          state: "partner_left",
+          message: "Your partner has left the chat."
+        });
+      });
+      rooms.delete(roomId);
+    }
   });
 
-  // ---------------- Disconnect ----------------
-  socket.on("disconnect", () => {
-    console.log(`❌ User disconnected: ${socket.id}`);
+  // --- Disconnect handler ---
+  socket.on("disconnect", (reason) => {
+    console.log(`❌ Disconnected: ${socket.id} Reason: ${reason}`);
 
-    // Remove from searching pool
-    if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
-      searchingUsers.delete(socket.id);
-    }
+    clearTimeout(timeouts.get(socket.id));
+    timeouts.delete(socket.id);
 
-    // Remove user from rooms
-    for (let [roomId, sockets] of rooms) {
-      if (sockets.includes(socket.id)) {
+    users.delete(socket.id);
+
+    Object.keys(queues).forEach((key) => {
+      queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
+    });
+
+    rooms.forEach((room, roomId) => {
+      if (room.users.includes(socket.id)) {
+        const partners = room.users.filter((id) => id !== socket.id);
+        partners.forEach((partnerId) => {
+          const partnerSocket = io.sockets.sockets.get
+            ? io.sockets.sockets.get(partnerId)
+            : io.sockets.connected[partnerId];
+          partnerSocket?.emit("status", {
+            state: "partner_disconnected",
+            message: "Your partner has disconnected."
+          });
+        });
         rooms.delete(roomId);
-        socket.to(roomId).emit("status", JSON.stringify({ state: "partner_disconnected", message: "Your partner left the chat." }));
       }
-    }
+    });
   });
 });
 
-// Start server
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log("🚀 Server running on port", PORT);
 });
