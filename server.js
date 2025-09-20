@@ -69,7 +69,7 @@ io.on("connection", (socket) => {
 
     if (matched) {
       const roomId = `room_${socket.id}_${matched.socketId}`;
-      console.log(`🎯 Match found: ${socket.id} + ${matched.socketId}`);
+      console.log(`🎯 Match found: ${socket.id} + ${matched.socketId} => ${roomId}`);
 
       socket.join(roomId);
       const matchedSocket = getSocketById(matched.socketId);
@@ -124,7 +124,13 @@ io.on("connection", (socket) => {
     }
 
     const { roomId, message, type, name, gender, time } = parsedData;
-    if (!roomId || !message || !type) return;
+
+    console.log(`📩 Chat event received from ${socket.id}:`, parsedData);
+
+    if (!roomId || !message || !type) {
+      console.warn(`⚠️ Invalid chat payload from ${socket.id}:`, parsedData);
+      return;
+    }
 
     if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
       // Emit message to everyone in the room except sender
@@ -136,7 +142,12 @@ io.on("connection", (socket) => {
         message,
         time
       }));
-      console.log(`💬 Message from ${socket.id} in ${roomId}: ${message}`);
+
+      console.log(`💬 Message sent in room ${roomId} by ${socket.id}:`, {
+        type,
+        message,
+        time
+      });
     } else {
       console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
     }
@@ -179,6 +190,7 @@ io.on("connection", (socket) => {
       if (sockets.includes(socket.id)) {
         rooms.delete(roomId);
         socket.to(roomId).emit("status", JSON.stringify({ state: "partner_disconnected", message: "Your partner left the chat." }));
+        console.log(`🚪 Room ${roomId} closed because ${socket.id} disconnected`);
       }
     }
   });
