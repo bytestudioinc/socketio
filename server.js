@@ -1,240 +1,116 @@
 const express = require("express");
 const http = require("http");
-const socketIo = require("socket.io");
+const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
 
-// Handle different socket.io versions
-let io;
-try {
-  const { Server } = require("socket.io"); // v3/v4
-  io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-  });
-} catch (e) {
-  io = require("socket.io")(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-  }); // v2 fallback
-}
+// Initialize Socket.IO
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+});
 
-// Queues and maps
-const queues = {
-  "male-any": [],
-  "female-any": [],
-  "male-male": [],
-  "male-female": [],
-  "female-male": [],
-  "female-female": []
-};
-
-const users = new Map();   // socket.id -> user
-const rooms = new Map();   // roomId -> { users: [socketIds] }
-const timeouts = new Map();// socket.id -> timeoutId
+let waitingUsers = []; // store users waiting for match
 
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
-  // --- Matchmaking event ---
-  socket.on("find", (rawData) => {
-    console.log(`📩 Find event from ${socket.id} =>`, rawData, "Type:", typeof rawData);
+  // Listen for all events
+  socket.onAny((event, data) => {
+    console.log(`📩 Event from ${socket.id} => ${event}`, data, "Type:", typeof data);
+  });
 
-    let data;
+  // Handle matchmaking request
+  socket.on("find", (data) => {
     try {
-      data = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
-    } catch (err) {
-      console.error("❌ Invalid JSON from client:", rawData);
-      return;
-    }
+      // Always parse JSON string from client
+      const user = typeof data === "string" ? JSON.parse(data) : data;
+      user.socketId = socket.id;
+      console.log("🔍 Find request:", user);
 
-    const { userId, name, gender, preference } = data;
-    const user = { userId, name, gender, preference, socketId: socket.id };
-    users.set(socket.id, user);
+      // Search for available partner
+      const partnerIndex = waitingUsers.findIndex(
+        (u) =>
+          u.userId !== user.userId &&
+          (user.preference === "any" || u.gender === user.preference) &&
+          (u.preference === "any" || user.gender === u.preference)
+      );
 
-    const queueKey = `${gender}-${preference}`;
-    let matchedUser = null;
+      if (partnerIndex !== -1) {
+        const matched = waitingUsers.splice(partnerIndex, 1)[0];
+        const roomId = `room_${user.userId}_${matched.userId}_${Date.now()}`;
 
-    if (preference === "any") {
-      const checkQueues = ["male-any", "female-any"];
-      for (let qKey of checkQueues) {
-        for (let i = 0; i < queues[qKey].length; i++) {
-          const candidate = queues[qKey][i];
-          if (candidate.preference === "any" || candidate.preference === gender) {
-            matchedUser = candidate;
-            queues[qKey].splice(i, 1);
-            break;
-          }
-        }
-        if (matchedUser) break;
-      }
-    } else {
-      const reverseQueueKey = `${preference}-${gender}`;
-      const anyQueueKey = `${preference}-any`;
+        // Join both sockets to room
+        socket.join(roomId);
+        io.sockets.sockets.get(matched.socketId)?.join(roomId);
 
-      if (queues[reverseQueueKey]?.length > 0) {
-        matchedUser = queues[reverseQueueKey].shift();
-      } else if (queues[anyQueueKey]?.length > 0) {
-        matchedUser = queues[anyQueueKey].shift();
-      }
-    }
+        console.log(`🎉 Match found! Room: ${roomId}`);
+        console.log("👉 Matched Users:", user, matched);
 
-    if (matchedUser) {
-      const roomId = `room_${Date.now()}`;
-      socket.join(roomId);
-
-      const matchedSocket = io.sockets.sockets.get
-        ? io.sockets.sockets.get(matchedUser.socketId) // v3+
-        : io.sockets.connected[matchedUser.socketId];  // v2
-
-      matchedSocket?.join(roomId);
-      rooms.set(roomId, { users: [socket.id, matchedUser.socketId] });
-
-      const statusDataForCurrent = {
-        state: "match_found",
-        message: "Partner found!",
-        roomId,
-        matchedUser: {
-          userId: matchedUser.userId,
-          name: matchedUser.name,
-          gender: matchedUser.gender
-        }
-      };
-
-      const statusDataForMatched = {
-        state: "match_found",
-        message: "Partner found!",
-        roomId,
-        matchedUser: {
-          userId: user.userId,
-          name: user.name,
-          gender: user.gender
-        }
-      };
-
-      console.log(`🤝 Match found! Room: ${roomId}, Users: ${socket.id}, ${matchedUser.socketId}`);
-      socket.emit("status", statusDataForCurrent);
-      matchedSocket?.emit("status", statusDataForMatched);
-    } else {
-      if (!queues[queueKey]) queues[queueKey] = [];
-      queues[queueKey].push(user);
-
-      console.log(`⌛ User ${socket.id} added to queue ${queueKey}`);
-
-      socket.emit("status", {
-        state: "searching",
-        message: "Searching for a partner..."
-      });
-
-      const timeoutId = setTimeout(() => {
-        console.log(`⏰ Timeout for user ${socket.id}`);
-        socket.emit("status", {
-          state: "timeout",
-          message: "Couldn't find a match."
-        });
-        Object.keys(queues).forEach(
-          (key) => (queues[key] = queues[key].filter((u) => u.socketId !== socket.id))
+        // Notify both users
+        socket.emit(
+          "status",
+          JSON.stringify({ state: "matched", roomId, partner: matched })
         );
-      }, 30000);
+        io.sockets.sockets
+          .get(matched.socketId)
+          ?.emit(
+            "status",
+            JSON.stringify({ state: "matched", roomId, partner: user })
+          );
+      } else {
+        // Add to waiting list
+        waitingUsers.push(user);
+        console.log("⏳ User added to waiting list:", user);
 
-      timeouts.set(socket.id, timeoutId);
-    }
-  });
+        socket.emit(
+          "status",
+          JSON.stringify({ state: "searching", message: "Searching for partner..." })
+        );
 
-  // --- Chat message event ---
-  socket.on("chat_message", (rawData) => {
-    console.log(`📩 Chat_message from ${socket.id} =>`, rawData, "Type:", typeof rawData);
-
-    let data;
-    try {
-      data = typeof rawData === "string" ? JSON.parse(rawData) : rawData;
+        // Set timeout if no match found
+        setTimeout(() => {
+          const idx = waitingUsers.findIndex((u) => u.userId === user.userId);
+          if (idx !== -1) {
+            waitingUsers.splice(idx, 1);
+            console.log("⌛ Timeout: No match found for", user.userId);
+            socket.emit(
+              "status",
+              JSON.stringify({ state: "timeout", message: "Couldn't find match" })
+            );
+          }
+        }, 30000); // 30 sec
+      }
     } catch (err) {
-      console.error("❌ Invalid JSON in chat_message:", rawData);
-      return;
-    }
-
-    const { roomId, userId, name, gender, msgType, content, time } = data;
-    console.log(`💬 User ${socket.id} sending to Room ${roomId}:`, data);
-
-    // Emit to others in the same room
-    socket.to(roomId).emit("chat_response", {
-      userId,
-      name,
-      gender,
-      msgType,
-      content,
-      time
-    });
-  });
-
-  // --- Cancel search ---
-  socket.on("cancel_search", () => {
-    clearTimeout(timeouts.get(socket.id));
-    timeouts.delete(socket.id);
-
-    Object.keys(queues).forEach((key) => {
-      queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
-    });
-    console.log(`❌ Search cancelled for ${socket.id}`);
-
-    socket.emit("status", {
-      state: "cancelled",
-      message: "Search cancelled."
-    });
-  });
-
-  // --- Leave chat ---
-  socket.on("leave_chat", ({ roomId }) => {
-    console.log(`👋 User ${socket.id} leaving room ${roomId}`);
-
-    socket.leave(roomId);
-
-    if (rooms.has(roomId)) {
-      const partners = rooms.get(roomId).users.filter((id) => id !== socket.id);
-      partners.forEach((partnerId) => {
-        const partnerSocket = io.sockets.sockets.get
-          ? io.sockets.sockets.get(partnerId)
-          : io.sockets.connected[partnerId];
-        partnerSocket?.emit("status", {
-          state: "partner_left",
-          message: "Your partner has left the chat."
-        });
-      });
-      rooms.delete(roomId);
+      console.error("❌ Error in find:", err);
     }
   });
 
-  // --- Disconnect handler ---
+  // Handle chat messages
+  socket.on("chat", (data) => {
+    try {
+      const msg = typeof data === "string" ? JSON.parse(data) : data;
+      console.log(`💬 Message from ${socket.id} to room ${msg.roomId}:`, msg);
+
+      // Send to other users in room
+      socket.to(msg.roomId).emit("chat_response", JSON.stringify(msg));
+    } catch (err) {
+      console.error("❌ Error in chat:", err);
+    }
+  });
+
+  // Handle disconnect
   socket.on("disconnect", (reason) => {
     console.log(`❌ Disconnected: ${socket.id} Reason: ${reason}`);
-
-    clearTimeout(timeouts.get(socket.id));
-    timeouts.delete(socket.id);
-
-    users.delete(socket.id);
-
-    Object.keys(queues).forEach((key) => {
-      queues[key] = queues[key].filter((u) => u.socketId !== socket.id);
-    });
-
-    rooms.forEach((room, roomId) => {
-      if (room.users.includes(socket.id)) {
-        const partners = room.users.filter((id) => id !== socket.id);
-        partners.forEach((partnerId) => {
-          const partnerSocket = io.sockets.sockets.get
-            ? io.sockets.sockets.get(partnerId)
-            : io.sockets.connected[partnerId];
-          partnerSocket?.emit("status", {
-            state: "partner_disconnected",
-            message: "Your partner has disconnected."
-          });
-        });
-        rooms.delete(roomId);
-      }
-    });
+    waitingUsers = waitingUsers.filter((u) => u.socketId !== socket.id);
   });
 });
 
-const PORT = process.env.PORT || 3000;
+// Start server
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log("🚀 Server running on port", PORT);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
