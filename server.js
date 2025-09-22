@@ -2,19 +2,19 @@
 
 const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io");
+const socketIO = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io = socketIO(server, {
   cors: {
-    origin: "*", // Allow all origins, adjust if needed
+    origin: "*", // Allow all origins (adjust for prod)
     methods: ["GET", "POST"],
   },
 });
 
 // --- Store active matches in memory ---
-let searchingUsers = new Map(); // socketId -> { name, gender }
+let searchingUsers = new Map(); // socketId -> { name, gender, timer }
 let activeRooms = new Map(); // roomId -> [socketId1, socketId2]
 
 /**
@@ -28,28 +28,42 @@ function generateRoomId(socket1, socket2) {
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
-  // Tell the client the server is ready
+  // Tell the client the server is ready + set timeout
   socket.emit("server_ready", {
     state: "server_ready",
     message: "Connected to server",
+    timeout: 60, // seconds
   });
 
   // --- Find a match ---
   socket.on("find", (data) => {
     console.log(`🔎 Match request from ${socket.id}:`, data);
 
-    // Save user into searching pool
+    // Add user to searching pool
     searchingUsers.set(socket.id, { ...data, socketId: socket.id });
 
-    // Try to find another user
+    // Set timeout for matchmaking
+    const timer = setTimeout(() => {
+      if (searchingUsers.has(socket.id)) {
+        searchingUsers.delete(socket.id);
+        io.to(socket.id).emit("status", { state: "timeout" });
+        console.log(`⌛ Match timeout for ${socket.id}`);
+      }
+    }, 60000); // 60s timeout
+
+    // Attach timer to user
+    searchingUsers.get(socket.id).timer = timer;
+
+    // Try to find a partner
     for (let [otherId, otherUser] of searchingUsers.entries()) {
       if (otherId !== socket.id) {
-        // Found a match
-        const roomId = generateRoomId(socket.id, otherId);
+        // Found match → clear timers
+        clearTimeout(searchingUsers.get(socket.id).timer);
+        clearTimeout(otherUser.timer);
 
+        const roomId = generateRoomId(socket.id, otherId);
         activeRooms.set(roomId, [socket.id, otherId]);
 
-        // Join sockets to the room
         socket.join(roomId);
         io.sockets.sockets.get(otherId)?.join(roomId);
 
@@ -67,13 +81,9 @@ io.on("connection", (socket) => {
         });
 
         console.log(`🎉 Match found! Room: ${roomId}`);
-        console.log(`   → ${socket.id} (${data.name})`);
-        console.log(`   → ${otherId} (${otherUser.name})`);
 
-        // Remove both from searching pool
         searchingUsers.delete(socket.id);
         searchingUsers.delete(otherId);
-
         break;
       }
     }
@@ -81,8 +91,6 @@ io.on("connection", (socket) => {
 
   // --- Chat messaging ---
   socket.on("chat", (payload) => {
-    console.log(`💬 Chat event from ${socket.id}:`, payload);
-
     const { roomId, message, name, gender, time } = payload;
 
     if (!roomId || !message) {
@@ -95,7 +103,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Relay the message to the room
     io.to(roomId).emit("chat", {
       roomId,
       name,
@@ -104,22 +111,24 @@ io.on("connection", (socket) => {
       time,
     });
 
-    console.log(`📤 Relayed message to room ${roomId}: ${message}`);
+    console.log(`💬 Message in ${roomId}: ${message}`);
   });
 
   // --- Handle disconnect ---
   socket.on("disconnect", () => {
     console.log(`❌ User disconnected: ${socket.id}`);
 
-    // Remove from searching
-    searchingUsers.delete(socket.id);
+    // Cancel timeout if still searching
+    if (searchingUsers.has(socket.id)) {
+      clearTimeout(searchingUsers.get(socket.id).timer);
+      searchingUsers.delete(socket.id);
+    }
 
-    // Remove from rooms
+    // Clean up rooms
     for (let [roomId, participants] of activeRooms.entries()) {
       if (participants.includes(socket.id)) {
         activeRooms.delete(roomId);
 
-        // Notify other participant
         participants.forEach((id) => {
           if (id !== socket.id) {
             io.to(id).emit("status", {
@@ -129,7 +138,7 @@ io.on("connection", (socket) => {
           }
         });
 
-        console.log(`🗑️ Room ${roomId} closed because ${socket.id} left`);
+        console.log(`🗑️ Room ${roomId} closed (user ${socket.id} left)`);
       }
     }
   });
