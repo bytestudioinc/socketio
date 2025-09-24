@@ -1,200 +1,212 @@
-// server.js
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 const server = http.createServer(app);
+
+// ✅ Allow only your app domain instead of "*"
 const io = new Server(server, {
   cors: {
-    origin: "*", // TODO: Replace with your app’s domain in production
+    origin: "*",
     methods: ["GET", "POST"],
   },
 });
 
-// In-memory store
-let waitingUsers = []; // users searching for matches
-let activeRooms = {}; // { roomId: { users: [], sockets: [] } }
+// Matchmaking queue
+let waitingUsers = {};
 
-/**
- * Helper: Normalize gender/preference
- * Supports both long-form and short-form
- */
-function normalizeInput(value, type) {
-  if (!value) return null;
+// Chatrooms
+let chatRooms = {};
 
-  value = value.toString().toLowerCase();
+// 🔹 Normalize gender & preference (support short forms + capitals)
+function normalizeInput(input, type) {
+  if (!input) return null;
+  const val = input.toLowerCase();
 
   if (type === "gender") {
-    if (value === "m" || value === "male") return "male";
-    if (value === "f" || value === "female") return "female";
+    if (val === "m" || val === "male") return "male";
+    if (val === "f" || val === "female") return "female";
   }
 
   if (type === "preference") {
-    if (value === "a" || value === "any") return "any";
-    if (value === "m" || value === "male") return "male";
-    if (value === "f" || value === "female") return "female";
+    if (val === "a" || val === "any") return "any";
+    if (val === "m" || val === "male") return "male";
+    if (val === "f" || val === "female") return "female";
   }
 
   return null;
 }
 
+// 🔹 Helper: generate roomId
+function generateRoomId(user1, user2) {
+  const randomNum = Math.floor(10000000 + Math.random() * 90000000); // 8-digit
+  return `${user1}_${randomNum}_${user2}`;
+}
+
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
-  // Send ready event with unique userId
-  socket.emit("server_ready", { userId: socket.id });
+  // 🔹 Send server_ready when connected
+  socket.emit("server_ready", {
+    state: "ready",
+    userId: socket.id,
+  });
 
-  /**
-   * Event: find (start searching for a match)
-   * Input: { userId, name, gender, preference }
-   */
+  // 🔹 Handle matchmaking request
   socket.on("find", (data) => {
-    const { userId, name, gender, preference } = data;
+    try {
+      const parsed = typeof data === "string" ? JSON.parse(data) : data;
 
-    const normGender = normalizeInput(gender, "gender");
-    const normPref = normalizeInput(preference, "preference");
+      const userId = parsed.userId;
+      const name = parsed.name;
+      const gender = normalizeInput(parsed.gender, "gender");
+      const preference = normalizeInput(parsed.preference, "preference");
 
-    if (!userId || !name || !normGender || !normPref) {
-      socket.emit("status", { status: "error", message: "Invalid input" });
-      return;
-    }
+      if (!userId || !name || !gender || !preference) {
+        console.log(`⚠️ Invalid matchmaking payload from ${socket.id}:`, parsed);
+        return socket.emit("status", { state: "error", message: "Invalid matchmaking data" });
+      }
 
-    console.log(`🔍 User ${name} searching: ${normGender}, prefers ${normPref}`);
+      console.log(`📩 Match request from ${socket.id}:`, parsed);
 
-    // Try to find a match
-    let matchIndex = waitingUsers.findIndex((u) => {
-      const prefOk =
-        (u.preference === "any" || u.preference === normGender) &&
-        (normPref === "any" || normPref === u.gender);
+      // Try to find a match
+      let matchedUserId = null;
+      for (let uid in waitingUsers) {
+        const candidate = waitingUsers[uid];
+        if (
+          candidate &&
+          uid !== userId &&
+          (candidate.preference === "any" || candidate.preference === gender) &&
+          (preference === "any" || preference === candidate.gender)
+        ) {
+          matchedUserId = uid;
+          break;
+        }
+      }
 
-      return prefOk;
-    });
+      if (matchedUserId) {
+        const matchedUser = waitingUsers[matchedUserId];
+        delete waitingUsers[matchedUserId];
 
-    if (matchIndex !== -1) {
-      // Found a match
-      const partner = waitingUsers.splice(matchIndex, 1)[0];
-      const roomId = uuidv4();
+        const roomId = generateRoomId(userId, matchedUser.userId);
+        chatRooms[roomId] = { users: [userId, matchedUser.userId] };
 
-      activeRooms[roomId] = {
-        users: [userId, partner.userId],
-        sockets: [socket.id, partner.socketId],
-      };
+        socket.join(roomId);
+        io.to(matchedUserId).socketsJoin(roomId);
 
-      socket.join(roomId);
-      io.to(partner.socketId).socketsJoin(roomId);
+        socket.emit("status", {
+          state: "matched",
+          roomId,
+          partner: {
+            userId: matchedUser.userId,
+            name: matchedUser.name,
+            gender: matchedUser.gender,
+            preference: matchedUser.preference,
+          },
+        });
 
-      io.to(roomId).emit("match_found", {
-        roomId,
-        users: [
-          { userId, name, gender: normGender },
-          { userId: partner.userId, name: partner.name, gender: partner.gender },
-        ],
-      });
+        io.to(matchedUserId).emit("status", {
+          state: "matched",
+          roomId,
+          partner: { userId, name, gender, preference },
+        });
 
-      console.log(`🎉 Match found! Room ${roomId}`);
-    } else {
-      // Add user to waiting queue
-      waitingUsers.push({
-        userId,
-        socketId: socket.id,
-        name,
-        gender: normGender,
-        preference: normPref,
-      });
-      socket.emit("status", { status: "searching" });
+        console.log(`🤝 Match found: ${userId} <-> ${matchedUser.userId} in ${roomId}`);
+      } else {
+        waitingUsers[userId] = { userId, name, gender, preference, socketId: socket.id };
+        socket.emit("status", { state: "searching" });
+        console.log(`⏳ User waiting: ${userId}`);
+      }
+    } catch (err) {
+      console.error("❌ Error in find event:", err);
+      socket.emit("status", { state: "error", message: "Server error" });
     }
   });
 
-  /**
-   * Event: cancel_search
-   * Input: { userId }
-   */
+  // 🔹 Cancel search
   socket.on("cancel_search", (data) => {
-    const { userId } = data || {};
-    if (!userId) {
-      socket.emit("status", { status: "error", message: "userId required" });
+    const parsed = typeof data === "string" ? JSON.parse(data) : data;
+    const userId = parsed?.userId;
+
+    if (userId && waitingUsers[userId]) {
+      delete waitingUsers[userId];
+      console.log(`🚫 User canceled search: ${userId}`);
+      socket.emit("status", { state: "canceled" });
+    }
+  });
+
+  // 🔹 Leave chat
+  socket.on("leave_chat", (data) => {
+    const parsed = typeof data === "string" ? JSON.parse(data) : data;
+    const roomId = parsed?.roomId;
+
+    if (roomId && chatRooms[roomId]) {
+      const users = chatRooms[roomId].users;
+      delete chatRooms[roomId];
+
+      users.forEach((uid) => {
+        io.to(uid).emit("chat_response", {
+          state: "partner_left",
+          roomId,
+        });
+      });
+
+      console.log(`👋 Chat ended in ${roomId}`);
+    }
+  });
+
+  // 🔹 Chat message
+  socket.on("chat_message", (data) => {
+    const parsed = typeof data === "string" ? JSON.parse(data) : data;
+    const { roomId, name, gender, message, type, time } = parsed || {};
+
+    if (!roomId || !chatRooms[roomId]) {
+      console.log(`⚠️ Invalid chat payload from ${socket.id}:`, parsed);
       return;
     }
 
-    waitingUsers = waitingUsers.filter((u) => u.userId !== userId);
-    socket.emit("status", { status: "search_cancelled" });
+    console.log(`💬 Message in ${roomId} from ${name}:`, message);
 
-    console.log(`❌ User ${userId} cancelled search`);
+    socket.to(roomId).emit("chat_response", {
+      state: "chatting",
+      roomId,
+      name,
+      gender,
+      message,
+      type,
+      time,
+    });
   });
 
-  /**
-   * Event: leave_chat
-   * Input: { roomId, userId }
-   */
-  socket.on("leave_chat", (data) => {
-    const { roomId, userId } = data || {};
-    if (!roomId || !userId) return;
-
-    if (activeRooms[roomId]) {
-      const partnerSockets = activeRooms[roomId].sockets.filter(
-        (sid) => sid !== socket.id
-      );
-
-      // Notify partner
-      partnerSockets.forEach((sid) =>
-        io.to(sid).emit("chat_response", {
-          status: "partner_left",
-          message: "Your partner has left the chat.",
-        })
-      );
-
-      delete activeRooms[roomId];
-      console.log(`👋 User ${userId} left chat room ${roomId}`);
-    }
-  });
-
-  /**
-   * Event: chat_message
-   * Input: { roomId, userId, message }
-   */
-  socket.on("chat_message", (data) => {
-    const { roomId, userId, message } = data || {};
-    if (!roomId || !userId || !message) return;
-
-    if (activeRooms[roomId]) {
-      socket.to(roomId).emit("chat_response", {
-        status: "chatting",
-        userId,
-        message,
-      });
-    }
-  });
-
-  /**
-   * Handle disconnection
-   */
+  // 🔹 Handle disconnect
   socket.on("disconnect", () => {
-    console.log(`⚠️ User disconnected: ${socket.id}`);
+    console.log(`❌ Disconnected: ${socket.id}`);
 
-    // Remove from waiting queue
-    waitingUsers = waitingUsers.filter((u) => u.socketId !== socket.id);
+    for (let uid in waitingUsers) {
+      if (waitingUsers[uid].socketId === socket.id) {
+        delete waitingUsers[uid];
+        console.log(`🗑️ Removed waiting user: ${uid}`);
+      }
+    }
 
-    // Handle if in active room
-    for (const [roomId, room] of Object.entries(activeRooms)) {
-      if (room.sockets.includes(socket.id)) {
-        const partnerSockets = room.sockets.filter((sid) => sid !== socket.id);
-
-        partnerSockets.forEach((sid) =>
-          io.to(sid).emit("chat_response", {
-            status: "disconnected",
-            message: "Your partner disconnected.",
-          })
-        );
-
-        delete activeRooms[roomId];
-        console.log(`💔 Room ${roomId} closed due to disconnect`);
+    for (let roomId in chatRooms) {
+      const users = chatRooms[roomId].users;
+      if (users.includes(socket.id)) {
+        users.forEach((uid) => {
+          if (uid !== socket.id) {
+            io.to(uid).emit("chat_response", {
+              state: "disconnected",
+              roomId,
+            });
+          }
+        });
+        delete chatRooms[roomId];
+        console.log(`💔 Room closed due to disconnect: ${roomId}`);
       }
     }
   });
 });
 
-server.listen(3000, () => {
-  console.log("🚀 Server running on http://localhost:3000");
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
