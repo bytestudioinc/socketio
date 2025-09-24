@@ -25,17 +25,22 @@ let rooms = new Map();           // roomId -> [socketIds]
 // ---------------- Timeout Messages ----------------
 const timeoutMessagesPaid = [
   "Oops, your match is busy. Try again!",
-  "Someone’s chatting, but you’ll get your turn!",
-  "Patience, young grasshopper, the match awaits!",
-  "Love is in the air… just not for you yet! Try Again...",
-  "Good things take time—your match is worth it!"
+  "Someone’s chatting, but you’ll get your turn. Try again!",
+  "Patience, young grasshopper, the match awaits. Try again!",
+  "Love is in the air… just not for you yet. Try again!",
+  "Good things take time—your match is worth it. Try again!",
+  "Your preferred partner is currently away. Try again!",
+  "Looks like Cupid is tied up. Try again!",
+  "They’re busy charming someone else. Try again!"
 ];
-const timeoutMessagesFree = [
-  "Everyone’s chatting. Hang tight!",
-  "No freebirds available. Try again!",
-  "All ears are busy. Retry shortly!",
-  "Cupid is taking a nap. Try again!",
-  "Good chats come to those who wait. Try again!"
+const timeoutMessagesFree = [  "Everyone’s chatting. Hang tight, try again!",
+  "No freebirds available. Retry shortly!",
+  "All ears are busy. Give it another try!",
+  "Cupid is taking a nap. Try again soon!",
+  "Good chats come to those who wait. Try again!",
+  "Looks like everyone’s talking. Try again!",
+  "No one is free right now. Try again!",
+  "All your potential partners are busy. Try again!"
 ];
 
 // ---------------- Helper Functions ----------------
