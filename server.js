@@ -1,186 +1,175 @@
 // server.js
 const express = require("express");
 const http = require("http");
+const { Server } = require("socket.io");
+
 const app = express();
 const server = http.createServer(app);
 
-const socketIo = require("socket.io");
-const io = socketIo(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+// Socket.IO setup
+const io = new Server(server, {
+  cors: {
+    origin: "*", // change this later to your app URL for security
+    methods: ["GET", "POST"]
+  }
+});
 
-const PORT = process.env.PORT || 10000;
+// Store connected users and matchmaking queue
+const connectedUsers = new Map(); // socketId -> userId
+const matchmakingQueue = new Map(); // userId -> {socketId, gender, preference}
+const activeChats = new Map(); // roomId -> {user1, user2}
 
-let searchingUsers = new Map();
-let rooms = new Map();
-
-// 🔹 Normalize gender & preference input
-function normalize(value, type) {
+// Helper to normalize gender/preference
+function normalizeValue(value) {
   if (!value) return null;
-  const v = value.toString().toUpperCase();
-  if (type === "gender") {
-    if (v === "M") return "male";
-    if (v === "F") return "female";
-    return "other";
+  switch (value.toUpperCase()) {
+    case "M": return "male";
+    case "F": return "female";
+    case "A": return "all";
+    case "MALE": return "male";
+    case "FEMALE": return "female";
+    case "ALL": return "all";
+    default: return null;
   }
-  if (type === "preference") {
-    if (v === "M") return "male";
-    if (v === "F") return "female";
-    if (v === "A") return "all";
-  }
-  return value.toLowerCase();
 }
 
-// 🔹 Generate RoomId
+// Helper to generate roomId
 function generateRoomId(user1, user2) {
-  const rand = Math.floor(10000000 + Math.random() * 90000000);
-  return `${user1}${rand}${user2}`;
-}
-
-// Get socket safely
-function getSocketById(socketId) {
-  if (io.sockets.sockets.get) return io.sockets.sockets.get(socketId); // v3/v4
-  return io.sockets.connected[socketId]; // v2
-}
-
-// Remove internal fields
-function getSafeUser(user) {
-  return {
-    userId: user.userId,
-    name: user.name,
-    gender: user.gender,
-    preference: user.preference
-  };
+  const random8 = Math.floor(10000000 + Math.random() * 90000000);
+  return `${user1}${random8}${user2}`;
 }
 
 io.on("connection", (socket) => {
-  console.log(`✅ User connected: ${socket.id}`);
+  console.log("New connection:", socket.id);
 
-  // ---------------- Server Ready ----------------
-  socket.emit("server_ready", JSON.stringify({ state: "ready", userId: socket.id }));
+  // Send server_ready with a unique userId
+  const userId = `user_${Math.floor(Math.random() * 1000000)}`;
+  connectedUsers.set(socket.id, userId);
+  socket.emit("server_ready", { status: "ready", userId });
 
-  // ---------------- Matchmaking ----------------
+  // Handle matchmaking
   socket.on("find", (data) => {
-    let parsedData = typeof data === "string" ? JSON.parse(data) : data;
-    parsedData.socketId = socket.id;
+    let { userId, gender, preference } = data;
 
-    // Normalize gender/preference
-    parsedData.gender = normalize(parsedData.gender, "gender");
-    parsedData.preference = normalize(parsedData.preference, "preference");
+    gender = normalizeValue(gender);
+    preference = normalizeValue(preference);
 
-    // Try to find a match
-    let matched = null;
-    for (let [otherId, otherUser] of searchingUsers) {
-      if (otherId !== socket.id) {
-        matched = otherUser;
-        break;
-      }
-    }
-
-    if (matched) {
-      const roomId = generateRoomId(socket.id, matched.socketId);
-      console.log(`🎯 Match found: ${socket.id} + ${matched.socketId} = ${roomId}`);
-
-      socket.join(roomId);
-      const matchedSocket = getSocketById(matched.socketId);
-      if (matchedSocket) matchedSocket.join(roomId);
-
-      rooms.set(roomId, [socket.id, matched.socketId]);
-
-      socket.emit("status", JSON.stringify({ state: "matched", roomId, partner: getSafeUser(matched) }));
-      matchedSocket?.emit("status", JSON.stringify({ state: "matched", roomId, partner: getSafeUser(parsedData) }));
-
-      searchingUsers.delete(socket.id);
-      searchingUsers.delete(matched.socketId);
-    } else {
-      // Add to queue with timeout
-      const timeout = setTimeout(() => {
-        if (searchingUsers.has(socket.id)) {
-          console.log(`⏰ Timeout for ${socket.id}`);
-          socket.emit("status", JSON.stringify({ state: "timeout", message: "Couldn't find a match" }));
-          searchingUsers.delete(socket.id);
-        }
-      }, 30000);
-
-      parsedData._timeout = timeout;
-      searchingUsers.set(socket.id, parsedData);
-      socket.emit("status", JSON.stringify({ state: "searching", message: "Searching for a partner..." }));
-    }
-  });
-
-  // ---------------- Cancel Search ----------------
-  socket.on("cancel_search", (data) => {
-    let parsedData = typeof data === "string" ? JSON.parse(data) : data;
-    const { userId } = parsedData || {};
-
-    if (userId && searchingUsers.has(userId)) {
-      const user = searchingUsers.get(userId);
-      if (user._timeout) clearTimeout(user._timeout);
-      searchingUsers.delete(userId);
-      socket.emit("status", JSON.stringify({ state: "cancelled", message: "Search cancelled." }));
-      console.log(`🚫 Search cancelled by ${userId}`);
-    }
-  });
-
-  // ---------------- Chat Messaging ----------------
-  socket.on("chat_message", (data) => {
-    let parsedData = typeof data === "string" ? JSON.parse(data) : data;
-    const { roomId, message, type, name, gender, time } = parsedData;
-    if (!roomId || !message || !type) {
-      console.warn(`⚠️ Invalid chat payload from ${socket.id}:`, parsedData);
+    if (!userId || !gender || !preference) {
+      socket.emit("status", { status: "error", message: "Invalid input" });
       return;
     }
 
-    if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
-      socket.to(roomId).emit("chat_response", JSON.stringify({
+    matchmakingQueue.set(userId, { socketId: socket.id, gender, preference });
+
+    // Try to find match
+    for (let [otherId, other] of matchmakingQueue.entries()) {
+      if (otherId === userId) continue;
+
+      const userPrefOk = (preference === "all" || preference === other.gender);
+      const otherPrefOk = (other.preference === "all" || other.preference === gender);
+
+      if (userPrefOk && otherPrefOk) {
+        const roomId = generateRoomId(userId, otherId);
+
+        activeChats.set(roomId, { user1: userId, user2: otherId });
+
+        io.to(socket.id).emit("status", {
+          status: "matched",
+          roomId,
+          partner: { userId: otherId, gender: other.gender }
+        });
+
+        io.to(other.socketId).emit("status", {
+          status: "matched",
+          roomId,
+          partner: { userId, gender }
+        });
+
+        matchmakingQueue.delete(userId);
+        matchmakingQueue.delete(otherId);
+        return;
+      }
+    }
+
+    socket.emit("status", { status: "searching" });
+  });
+
+  // Cancel search
+  socket.on("cancel_search", (data) => {
+    const { userId } = data;
+    matchmakingQueue.delete(userId);
+    socket.emit("status", { status: "search_cancelled" });
+  });
+
+  // Handle chat messages
+  socket.on("chat_message", (data) => {
+    const { roomId, senderId, message } = data;
+    const chat = activeChats.get(roomId);
+
+    if (!chat) return;
+
+    const receiverId = chat.user1 === senderId ? chat.user2 : chat.user1;
+    const receiverSocket = [...connectedUsers.entries()]
+      .find(([sid, uid]) => uid === receiverId)?.[0];
+
+    if (receiverSocket) {
+      io.to(receiverSocket).emit("chat_response", {
         status: "chatting",
-        from: socket.id,
-        name,
-        gender,
-        type,
-        message,
-        time
-      }));
-      console.log(`💬 Message from ${socket.id} in ${roomId}: ${message}`);
-    } else {
-      console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
+        roomId,
+        senderId,
+        message
+      });
     }
   });
 
-  // ---------------- Leave Chat ----------------
+  // Leave chat voluntarily
   socket.on("leave_chat", (data) => {
-    let parsedData = typeof data === "string" ? JSON.parse(data) : data;
-    const { roomId } = parsedData || {};
-    if (!roomId || !rooms.has(roomId)) return;
+    const { roomId, userId } = data;
+    const chat = activeChats.get(roomId);
 
-    const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
-    otherUsers.forEach(id => {
-      const s = getSocketById(id);
-      s?.emit("chat_response", JSON.stringify({ status: "partner_left", message: "Your partner left the chat." }));
-    });
+    if (!chat) return;
 
-    socket.leave(roomId);
-    rooms.delete(roomId);
-    console.log(`🚪 ${socket.id} left room ${roomId}`);
-  });
+    const partnerId = chat.user1 === userId ? chat.user2 : chat.user1;
+    const partnerSocket = [...connectedUsers.entries()]
+      .find(([sid, uid]) => uid === partnerId)?.[0];
 
-  // ---------------- Disconnect ----------------
-  socket.on("disconnect", () => {
-    console.log(`❌ User disconnected: ${socket.id}`);
-
-    if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
-      searchingUsers.delete(socket.id);
+    if (partnerSocket) {
+      io.to(partnerSocket).emit("chat_response", {
+        status: "partner_left",
+        roomId
+      });
     }
 
-    for (let [roomId, sockets] of rooms) {
-      if (sockets.includes(socket.id)) {
-        rooms.delete(roomId);
-        socket.to(roomId).emit("chat_response", JSON.stringify({ status: "disconnected", message: "Your partner disconnected." }));
+    activeChats.delete(roomId);
+    socket.emit("chat_response", { status: "left", roomId });
+  });
+
+  // Handle disconnection
+  socket.on("disconnect", () => {
+    const userId = connectedUsers.get(socket.id);
+    console.log("User disconnected:", userId);
+
+    connectedUsers.delete(socket.id);
+    matchmakingQueue.delete(userId);
+
+    for (let [roomId, chat] of activeChats.entries()) {
+      if (chat.user1 === userId || chat.user2 === userId) {
+        const partnerId = chat.user1 === userId ? chat.user2 : chat.user1;
+        const partnerSocket = [...connectedUsers.entries()]
+          .find(([sid, uid]) => uid === partnerId)?.[0];
+
+        if (partnerSocket) {
+          io.to(partnerSocket).emit("chat_response", {
+            status: "disconnected",
+            roomId
+          });
+        }
+
+        activeChats.delete(roomId);
       }
     }
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
