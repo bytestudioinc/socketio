@@ -115,7 +115,7 @@ io.on("connection", (socket) => {
     reward: 50,                // daily reward points
     preferenceCost: 20,        // cost for preference feature
     maintenance: "no"          // "yes" or "no" });
-
+  });
   // ---------------- Find Match ----------------
   // Data: { userId, name, gender, preference }
   socket.on("find", (data) => {
