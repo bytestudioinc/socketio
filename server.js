@@ -269,6 +269,7 @@ io.on("connection", (socket) => {
       if (s) {
         sendToClient(s, "chat_response", {
           status: "chatting",
+          croomId: socket.roomId,
           from: socket.id,
           name,
           gender,
