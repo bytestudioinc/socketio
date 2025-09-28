@@ -107,7 +107,14 @@ io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
   // Notify client server is ready
-  sendToClient(socket, "server_ready", { state: "ready", userId: socket.id });
+  sendToClient(socket, "server_ready", 
+  { 
+    state: "ready",
+    userId: socket.id,
+    version: "1.0.3",          // app version
+    reward: 50,                // daily reward points
+    preferenceCost: 20,        // cost for preference feature
+    maintenance: "no"          // "yes" or "no" });
 
   // ---------------- Find Match ----------------
   // Data: { userId, name, gender, preference }
