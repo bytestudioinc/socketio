@@ -4,7 +4,7 @@ const http = require("http");
 const app = express();
 const server = http.createServer(app);
 
-// Initialize Socket.IO safely
+// Initialize Socket.IO safely (v2/v3/v4 compatible)
 let io;
 try {
   const { Server } = require("socket.io");
@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 10000;
 
 // ---------------- Users & Rooms ----------------
 let searchingUsers = new Map(); // socketId -> user info
-let rooms = new Map();           // roomId -> [socketIds]
+let rooms = new Map();          // roomId -> [socketIds]
 
 // ---------------- Timeout Messages ----------------
 const timeoutMessagesPaid = [
@@ -46,7 +46,6 @@ const timeoutMessagesFree = [
 
 // ---------------- Helper Functions ----------------
 
-// Normalize gender/preference input
 function normalizeGenderPref(value) {
   if (!value) return "Any";
   value = value.toString().toUpperCase();
@@ -56,12 +55,10 @@ function normalizeGenderPref(value) {
   return "Any";
 }
 
-// Generate random 8-digit number string
 function random8Digit() {
   return Math.floor(10000000 + Math.random() * 90000000).toString();
 }
 
-// Get safe user object for emitting (avoid circular)
 function getSafeUser(user) {
   return {
     userId: user.userId,
@@ -71,117 +68,181 @@ function getSafeUser(user) {
   };
 }
 
-// Safe get socket by id for v2/v4
 function getSocketById(socketId) {
-  if (io.sockets.sockets.get) return io.sockets.sockets.get(socketId);
-  return io.sockets.connected[socketId];
+  if (!socketId) return null;
+  if (io.sockets && io.sockets.sockets && typeof io.sockets.sockets.get === "function") {
+    return io.sockets.sockets.get(socketId); // v3/v4
+  }
+  return io.sockets.connected && io.sockets.connected[socketId]; // v2
 }
 
-// Universal parse for Kodular dictionaries / JSON / objects
 function parseClientData(data) {
   let parsed = {};
   try {
     if (!data) return {};
-    if (typeof data === "string") {
-      parsed = JSON.parse(data);
-    } else if (typeof data === "object") {
-      parsed = JSON.parse(JSON.stringify(data)); // handle JSONObject
-    }
+    if (typeof data === "string") parsed = JSON.parse(data);
+    else if (typeof data === "object") parsed = JSON.parse(JSON.stringify(data)); // handle JSONObject from Kodular
   } catch (e) {
     console.warn("⚠️ parseClientData failed:", e);
   }
   return parsed;
 }
 
-// Always send data as JSON string for Kodular
-function sendToClient(socket, event, payload) {
+function sendToClient(socketOrSocketId, event, payload) {
   try {
-    socket.emit(event, JSON.stringify(payload));
+    // socketOrSocketId can be a socket instance or a socket id
+    if (!socketOrSocketId) return;
+    if (typeof socketOrSocketId === "string") {
+      const s = getSocketById(socketOrSocketId);
+      if (s) s.emit(event, JSON.stringify(payload));
+    } else {
+      socketOrSocketId.emit(event, JSON.stringify(payload));
+    }
   } catch (e) {
     console.warn("⚠️ sendToClient failed:", e);
   }
 }
 
+// Remove / clean up a room (notify partner(s), make sockets leave, delete room)
+function cleanupRoom(roomId, leavingSocketId) {
+  const socketsInRoom = rooms.get(roomId);
+  if (!socketsInRoom) return;
+  console.log(`🧹 Cleaning room ${roomId} due to ${leavingSocketId}`);
+
+  socketsInRoom.forEach((sid) => {
+    const s = getSocketById(sid);
+    if (!s) return;
+    if (sid !== leavingSocketId) {
+      sendToClient(s, "chat_response", { status: "partner_left", message: "Your partner left the chat." });
+    }
+    try { s.leave(roomId); } catch (e) { /* ignore */ }
+  });
+
+  rooms.delete(roomId);
+  console.log(`🗑 Room ${roomId} removed`);
+}
+
+// Remove socket from any rooms it's in and cleanup those rooms
+function removeSocketFromAllRooms(socketId) {
+  for (let [roomId, socketsInRoom] of Array.from(rooms.entries())) {
+    if (socketsInRoom.includes(socketId)) {
+      cleanupRoom(roomId, socketId);
+    }
+  }
+}
+
+// Debug helpers
+function logSearchingUsers() {
+  console.log("🔎 searchingUsers count:", searchingUsers.size);
+}
+function logRooms() {
+  console.log("📦 active rooms:", Array.from(rooms.keys()));
+}
+
 // ---------------- Socket.IO ----------------
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
+  logSearchingUsers();
+  logRooms();
 
-  // Notify client server is ready
-  sendToClient(socket, "server_ready", 
-  { 
+  // send server_ready (static config values included)
+  sendToClient(socket, "server_ready", {
     state: "ready",
     userId: socket.id,
-    version: "1.13",          // app version
-    reward: 1,                // daily reward points
-    preferenceCost: 10,        // cost for preference feature
-    maintenance: "no",          // "yes" or "no" });
-    url: "https://play.google.com/store/apps/details?id=com.byte.strangerchat"  
+    version: "1.13",
+    reward: 1,
+    preferenceCost: 10,
+    maintenance: "no",
+    url: "https://play.google.com/store/apps/details?id=com.byte.strangerchat"
   });
-  // ---------------- Find Match ----------------
-  // Data: { userId, name, gender, preference }
-  socket.on("find", (data) => {
-    let parsed = parseClientData(data);
 
+  // ---------------- Find Match ----------------
+  socket.on("find", (data) => {
+    const parsed = parseClientData(data);
+
+    // normalize and set socketId
     parsed.socketId = socket.id;
     parsed.gender = normalizeGenderPref(parsed.gender);
     parsed.preference = normalizeGenderPref(parsed.preference);
 
-    // ---------------- Matchmaking ----------------
+    console.log(`📩 find from ${socket.id}:`, { userId: parsed.userId, name: parsed.name, gender: parsed.gender, preference: parsed.preference });
+
+    // Ensure this socket isn't in any old room(s) — clean up previous rooms to prevent ghosts
+    removeSocketFromAllRooms(socket.id);
+
+    // ---------------- Matchmaking (priority: specific preference over Any) ----------------
     let matched = null;
-    let paidUser = parsed.preference !== "Any";
+    const isPaid = parsed.preference !== "Any";
 
-    for (let [otherId, otherUser] of searchingUsers) {
-      if (otherId === socket.id) continue;
-
+    for (let [otherSocketId, otherUser] of searchingUsers) {
+      if (otherSocketId === socket.id) continue;
       const otherPaid = otherUser.preference !== "Any";
-      const genderMatch = parsed.preference === "Any" || parsed.preference === otherUser.gender;
-      const reverseMatch = otherUser.preference === "Any" || otherUser.preference === parsed.gender;
-
+      const genderMatch = (parsed.preference === "Any") || (parsed.preference === otherUser.gender);
+      const reverseMatch = (otherUser.preference === "Any") || (otherUser.preference === parsed.gender);
       if (genderMatch && reverseMatch) {
-        if (paidUser && otherPaid) { matched = otherUser; break; }
+        if (isPaid && otherPaid) { matched = otherUser; break; }
         if (!matched) matched = otherUser;
       }
     }
 
     if (matched) {
-      const roomId = `${parsed.name}${random8Digit()}${matched.name}`;
-      socket.join(roomId);
-      const matchedSocket = getSocketById(matched.socketId);
-      if (matchedSocket) matchedSocket.join(roomId);
+      // clear any timeouts from previously waiting users
+      if (matched._timeout) clearTimeout(matched._timeout);
+      if (parsed._timeout) clearTimeout(parsed._timeout);
 
-      rooms.set(roomId, [socket.id, matched.socketId]);
-      console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
-
-      sendToClient(socket, "status", { state: "match_found", roomId, partner: getSafeUser(matched) });
-      if (matchedSocket) sendToClient(matchedSocket, "status", { state: "match_found", roomId, partner: getSafeUser(parsed) });
-
+      // remove matched users from searching pool
       searchingUsers.delete(socket.id);
       searchingUsers.delete(matched.socketId);
+
+      // ensure matched user isn't in any other rooms (cleanup)
+      removeSocketFromAllRooms(matched.socketId);
+
+      // generate room using names (sanitized simple join)
+      const roomId = `${(parsed.name || "user")}${random8Digit()}${(matched.name || "user")}`;
+
+      // join both
+      try { socket.join(roomId); } catch (e) {}
+      const matchedSocket = getSocketById(matched.socketId);
+      if (matchedSocket) try { matchedSocket.join(roomId); } catch (e) {}
+
+      rooms.set(roomId, [socket.id, matched.socketId]);
+      console.log(`🎯 Match: ${socket.id} + ${matched.socketId} => ${roomId}`);
+      logRooms();
+
+      // send match info
+      sendToClient(socket, "status", { state: "match_found", roomId, partner: getSafeUser(matched) });
+      if (matchedSocket) sendToClient(matchedSocket, "status", { state: "match_found", roomId, partner: getSafeUser(parsed) });
     } else {
+      // add to search pool with timeout
       const timeout = setTimeout(() => {
         if (searchingUsers.has(socket.id)) {
-          const msgPool = parsed.preference === "Any" ? timeoutMessagesFree : timeoutMessagesPaid;
-          const randomMsg = msgPool[Math.floor(Math.random() * msgPool.length)];
-          sendToClient(socket, "status", { state: "timeout", message: randomMsg });
-          console.log(`⏰ Timeout for ${socket.id}: ${randomMsg}`);
+          const pool = parsed.preference === "Any" ? timeoutMessagesFree : timeoutMessagesPaid;
+          const msg = pool[Math.floor(Math.random() * pool.length)];
+          sendToClient(socket, "status", { state: "timeout", message: msg });
+          console.log(`⏰ Timeout for ${socket.id}: ${msg}`);
           searchingUsers.delete(socket.id);
+          logSearchingUsers();
         }
       }, 30000);
 
       parsed._timeout = timeout;
       searchingUsers.set(socket.id, parsed);
       sendToClient(socket, "status", { state: "searching", message: "Searching for a partner..." });
+      logSearchingUsers();
     }
   });
 
   // ---------------- Cancel Search ----------------
   socket.on("cancel_search", () => {
     if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
+      const u = searchingUsers.get(socket.id);
+      if (u._timeout) clearTimeout(u._timeout);
       searchingUsers.delete(socket.id);
       sendToClient(socket, "status", { state: "cancelled", message: "Search cancelled." });
-      console.log(`🚫 Search cancelled by ${socket.id}`);
+      console.log(`🚫 cancel_search by ${socket.id}`);
+      logSearchingUsers();
+    } else {
+      sendToClient(socket, "status", { state: "cancelled", message: "Not currently searching." });
     }
   });
 
@@ -189,60 +250,67 @@ io.on("connection", (socket) => {
   socket.on("chat_message", (data) => {
     const parsed = parseClientData(data);
     const { roomId, message, type, name, gender, time } = parsed;
-    if (!roomId || !message || !type) return;
-
-    if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
-      socket.to(roomId).emit("chat_response", JSON.stringify({
-        status: "chatting",
-        from: socket.id,
-        name,
-        gender,
-        type,
-        message,
-        time
-      }));
-      console.log(`💬 ${socket.id} in ${roomId}: ${message}`);
-    } else {
-      console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
+    if (!roomId || !message || !type) {
+      console.warn(`⚠️ Invalid chat_message from ${socket.id}`, parsed);
+      return;
     }
+
+    const participants = rooms.get(roomId);
+    if (!participants || !participants.includes(socket.id)) {
+      console.warn(`⚠️ ${socket.id} tried to send to invalid/unknown room ${roomId}`);
+      return;
+    }
+
+    // send directly to each partner socket to avoid room ghost duplication
+    let recipients = 0;
+    for (const sid of participants) {
+      if (sid === socket.id) continue;
+      const s = getSocketById(sid);
+      if (s) {
+        sendToClient(s, "chat_response", {
+          status: "chatting",
+          from: socket.id,
+          name,
+          gender,
+          type,
+          message,
+          time
+        });
+        recipients++;
+        console.log(`📨 Delivered chat from ${socket.id} to ${sid} in ${roomId}`);
+      } else {
+        console.log(`⚠️ recipient ${sid} socket not found for room ${roomId}`);
+      }
+    }
+    console.log(`💬 [${roomId}] ${socket.id} -> ${recipients} recipient(s): ${message}`);
   });
 
   // ---------------- Leave Chat ----------------
   socket.on("leave_chat", (data) => {
     const parsed = parseClientData(data);
     const { roomId } = parsed;
-    if (!roomId || !rooms.has(roomId)) return;
+    if (!roomId) return;
+    if (!rooms.has(roomId)) return;
 
-    const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
-    otherUsers.forEach(id => {
-      const s = getSocketById(id);
-      if (s) sendToClient(s, "chat_response", { status: "partner_left", message: "Your partner left the chat." });
-    });
-
-    socket.leave(roomId);
-    rooms.delete(roomId);
-    console.log(`🚪 ${socket.id} left room ${roomId}`);
+    console.log(`🚪 leave_chat by ${socket.id} for room ${roomId}`);
+    cleanupRoom(roomId, socket.id);
+    logRooms();
   });
 
   // ---------------- Disconnect ----------------
-  socket.on("disconnect", () => {
-    console.log(`❌ User disconnected: ${socket.id}`);
-
+  socket.on("disconnect", (reason) => {
+    console.log(`❌ disconnect: ${socket.id} reason: ${reason}`);
+    // remove from searching pool
     if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
+      const u = searchingUsers.get(socket.id);
+      if (u._timeout) clearTimeout(u._timeout);
       searchingUsers.delete(socket.id);
+      logSearchingUsers();
     }
 
-    for (let [roomId, sockets] of rooms) {
-      if (sockets.includes(socket.id)) {
-        rooms.delete(roomId);
-        socket.to(roomId).emit("chat_response", JSON.stringify({
-          status: "partner_disconnected",
-          message: "Your partner left the chat."
-        }));
-      }
-    }
+    // cleanup rooms where this socket is a participant
+    removeSocketFromAllRooms(socket.id);
+    logRooms();
   });
 });
 
