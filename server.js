@@ -111,7 +111,7 @@ io.on("connection", (socket) => {
   { 
     state: "ready",
     userId: socket.id,
-    version: "1.0.3",          // app version
+    version: "1.13",          // app version
     reward: 1,                // daily reward points
     preferenceCost: 10,        // cost for preference feature
     maintenance: "no",          // "yes" or "no" });
