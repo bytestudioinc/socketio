@@ -115,7 +115,7 @@ io.on("connection", (socket) => {
     reward: 1,                // daily reward points
     preferenceCost: 10,        // cost for preference feature
     maintenance: "no",          // "yes" or "no" });
-    url: "https://play.google.com/apps/details?id=com.byte.strangerchat"  
+    url: "https://play.google.com/store/apps/details?id=com.byte.strangerchat"  
   });
   // ---------------- Find Match ----------------
   // Data: { userId, name, gender, preference }
