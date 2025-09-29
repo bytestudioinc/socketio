@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 10000;
 
 // ---------------- Users & Rooms ----------------
 let searchingUsers = new Map(); // socketId -> user info
-let rooms = new Map();           // roomId -> [socketIds]
+let rooms = new Map();          // roomId -> [socketIds]
 
 // ---------------- Timeout Messages ----------------
 const timeoutMessagesPaid = [
@@ -95,6 +95,31 @@ function sendToClient(socket, event, payload) {
   }
 }
 
+// ---------------- Cleanup Helper ----------------
+function cleanupRoom(roomId, reason) {
+  if (!rooms.has(roomId)) return;
+  const socketIds = rooms.get(roomId);
+
+  console.log(`🧹 Cleaning up room ${roomId} due to: ${reason}`);
+  socketIds.forEach((id) => {
+    const s = getSocketById(id);
+    if (s) {
+      s.leave(roomId);
+      sendToClient(s, "chat_response", {
+        status: reason,
+        roomId,
+        message: reason === "partner_left" || reason === "partner_disconnected"
+          ? "Your partner left the chat."
+          : "Chat ended."
+      });
+      console.log(`   ↳ Removed socket ${id} from room ${roomId}`);
+    }
+  });
+
+  rooms.delete(roomId);
+  console.log(`✅ Room ${roomId} deleted`);
+}
+
 // ---------------- Socket.IO ----------------
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
@@ -141,7 +166,7 @@ io.on("connection", (socket) => {
       if (matchedSocket) matchedSocket.join(roomId);
 
       rooms.set(roomId, [socket.id, matched.socketId]);
-      console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
+      console.log(`🎯 Match created: ${socket.id} + ${matched.socketId} in room ${roomId}`);
 
       sendToClient(socket, "status", { state: "match_found", roomId, partner: getSafeUser(matched) });
       if (matchedSocket) sendToClient(matchedSocket, "status", { state: "match_found", roomId, partner: getSafeUser(parsed) });
@@ -205,15 +230,8 @@ io.on("connection", (socket) => {
     const { roomId } = parsed;
     if (!roomId || !rooms.has(roomId)) return;
 
-    const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
-    otherUsers.forEach(id => {
-      const s = getSocketById(id);
-      if (s) sendToClient(s, "chat_response", { status: "partner_left", roomId, message: "Your partner left the chat." });
-    });
-
-    socket.leave(roomId);
-    rooms.delete(roomId);
-    console.log(`🚪 ${socket.id} left room ${roomId}`);
+    console.log(`🚪 ${socket.id} voluntarily leaving room ${roomId}`);
+    cleanupRoom(roomId, "partner_left");
   });
 
   // ---------------- Disconnect ----------------
@@ -228,12 +246,8 @@ io.on("connection", (socket) => {
 
     for (let [roomId, sockets] of rooms) {
       if (sockets.includes(socket.id)) {
-        rooms.delete(roomId);
-        socket.to(roomId).emit("chat_response", JSON.stringify({
-          status: "partner_disconnected",
-          roomId,
-          message: "Your partner left the chat."
-        }));
+        console.log(`⚡ ${socket.id} disconnected while in room ${roomId}`);
+        cleanupRoom(roomId, "partner_disconnected");
       }
     }
   });
