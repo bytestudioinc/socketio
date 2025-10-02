@@ -1,11 +1,21 @@
 // server.js
 const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io");
-
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+
+let io;
+try {
+  // Socket.IO v3+ style
+  const { Server } = require("socket.io");
+  io = new Server(server, { cors: { origin: "*" } });
+  console.log("✅ Socket.IO v3+ initialized");
+} catch (e) {
+  // Fallback to v2
+  const socketIo = require("socket.io");
+  io = socketIo(server, { cors: { origin: "*" } });
+  console.log("✅ Socket.IO v2 initialized (fallback)");
+}
 
 // ------------------ Data Stores ------------------
 let searchingUsers = new Map(); // socketId -> user info
@@ -22,7 +32,7 @@ function parseClientData(data) {
 }
 
 function getSocketById(socketId) {
-  if (io.sockets.sockets.get) return io.sockets.sockets.get(socketId);
+  if (io.sockets.sockets?.get) return io.sockets.sockets.get(socketId);
   return io.sockets.connected[socketId];
 }
 
@@ -64,7 +74,7 @@ io.on("connection", (socket) => {
     for (let [otherId, otherUser] of searchingUsers) {
       if (otherId === socket.id) continue;
       matched = otherUser;
-      break; // match first available
+      break; // first available match
     }
 
     if (matched) {
@@ -134,7 +144,7 @@ io.on("connection", (socket) => {
       }
 
       socket.leave(roomId);
-      rooms.delete(roomId); // remove room after one leaves (optional: or keep it)
+      rooms.delete(roomId); // optional: keep if you want room to persist
     }
   });
 
@@ -151,7 +161,7 @@ io.on("connection", (socket) => {
           console.log(`⚡ ${socket.id} disconnected, notifying partner ${partnerId}`);
           sendToClient(getSocketById(partnerId), "chat_response", { status: "partner_disconnected", roomId, partner: socket.id }, roomId);
         }
-        rooms.delete(roomId); // optional: delete room here if you want
+        rooms.delete(roomId); // optional
       }
     }
   });
