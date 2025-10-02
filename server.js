@@ -142,8 +142,14 @@ io.on("connection", (socket) => {
       rooms.set(roomId, [socket.id, matched.socketId]);
       console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
 
+      // 🔹 Emit BOTH events so client listening to 'status' gets match info
+      sendToClient(socket, "status", { state: "match_found", roomId, partner: getSafeUser(matched) });
       sendToClient(socket, "chat_response", { state: "match_found", roomId, partner: getSafeUser(matched) }, roomId);
-      if (matchedSocket) sendToClient(matchedSocket, "chat_response", { state: "match_found", roomId, partner: getSafeUser(parsed) }, roomId);
+
+      if (matchedSocket) {
+        sendToClient(matchedSocket, "status", { state: "match_found", roomId, partner: getSafeUser(parsed) });
+        sendToClient(matchedSocket, "chat_response", { state: "match_found", roomId, partner: getSafeUser(parsed) }, roomId);
+      }
 
       searchingUsers.delete(socket.id);
       searchingUsers.delete(matched.socketId);
@@ -212,7 +218,7 @@ io.on("connection", (socket) => {
     });
 
     socket.leave(roomId);
-    rooms.delete(roomId); // remove room after leave
+    rooms.delete(roomId);
     console.log(`🚪 ${socket.id} left room ${roomId}`);
   });
 
