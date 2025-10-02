@@ -101,7 +101,7 @@ io.on("connection", (socket) => {
   sendToClient(socket, "server_ready", { 
     state: "ready",
     userId: socket.id,
-    version: "1.15",
+    version: "1.13",
     reward: 1,
     preferenceCost: 10,
     maintenance: "no",
