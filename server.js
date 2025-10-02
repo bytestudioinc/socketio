@@ -6,12 +6,10 @@ const server = http.createServer(app);
 
 let io;
 try {
-  // Socket.IO v3+ style
   const { Server } = require("socket.io");
   io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
   console.log("✅ Using Socket.IO v3/v4");
 } catch (e) {
-  // Fallback to v2
   const socketIo = require("socket.io");
   io = socketIo(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
   console.log("✅ Using Socket.IO v2 fallback");
@@ -61,7 +59,6 @@ function random8Digit() {
 
 function getSafeUser(user) {
   return {
-    userId: user.userId,
     name: user.name,
     gender: user.gender,
     preference: user.preference
@@ -85,10 +82,9 @@ function parseClientData(data) {
   return parsed;
 }
 
-function sendToClient(socket, event, payload, roomId = null) {
+function sendToClient(socket, event, payload) {
   try {
-    const evt = roomId ? `${event}/${roomId}` : event;
-    socket.emit(evt, JSON.stringify(payload));
+    socket.emit(event, JSON.stringify(payload));
   } catch (e) {
     console.warn("⚠️ sendToClient failed:", e);
   }
@@ -98,10 +94,10 @@ function sendToClient(socket, event, payload, roomId = null) {
 io.on("connection", (socket) => {
   console.log(`✅ User connected: ${socket.id}`);
 
+  // Notify client server is ready
   sendToClient(socket, "server_ready", { 
     state: "ready",
-    userId: socket.id,
-    version: "1.13",
+    version: "1.16",
     reward: 1,
     preferenceCost: 10,
     maintenance: "no",
@@ -142,17 +138,9 @@ io.on("connection", (socket) => {
       rooms.set(roomId, [socket.id, matched.socketId]);
       console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
 
-      // 🔹 Emit BOTH events so client listening to 'status' gets match info
+      // Emit match found to both users
       sendToClient(socket, "status", { state: "match_found", roomId, partner: getSafeUser(matched) });
-      sendToClient(socket, "chat_response", { state: "match_found", roomId, partner: getSafeUser(matched) }, roomId);
-
-      if (matchedSocket) {
-        sendToClient(matchedSocket, "status", { state: "match_found", roomId, partner: getSafeUser(parsed) });
-        sendToClient(matchedSocket, "chat_response", { state: "match_found", roomId, partner: getSafeUser(parsed) }, roomId);
-      }
-
-      searchingUsers.delete(socket.id);
-      searchingUsers.delete(matched.socketId);
+      sendToClient(matchedSocket, "status", { state: "match_found", roomId, partner: getSafeUser(parsed) });
     } else {
       const timeout = setTimeout(() => {
         if (searchingUsers.has(socket.id)) {
@@ -171,7 +159,8 @@ io.on("connection", (socket) => {
   });
 
   // ---------------- Cancel Search ----------------
-  socket.on("cancel_search", () => {
+  socket.on("cancel_search", (data) => {
+    // We ignore data, use socket.id internally
     if (searchingUsers.has(socket.id)) {
       const user = searchingUsers.get(socket.id);
       if (user._timeout) clearTimeout(user._timeout);
@@ -185,11 +174,10 @@ io.on("connection", (socket) => {
   socket.on("chat_message", (data) => {
     const parsed = parseClientData(data);
     const { roomId, message, type, name, gender, time } = parsed;
-
     if (!roomId || !message || !type) return;
 
     if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
-      socket.to(roomId).emit(`chat_response/${roomId}`, JSON.stringify({
+      socket.to(roomId).emit("chat_response", JSON.stringify({
         status: "chatting",
         roomId,
         from: socket.id,
@@ -214,7 +202,7 @@ io.on("connection", (socket) => {
     const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
     otherUsers.forEach(id => {
       const s = getSocketById(id);
-      if (s) sendToClient(s, "chat_response", { status: "partner_left", roomId, message: "Your partner left the chat." }, roomId);
+      if (s) sendToClient(s, "chat_response", { status: "partner_left", roomId, message: "Your partner left the chat." });
     });
 
     socket.leave(roomId);
@@ -235,7 +223,7 @@ io.on("connection", (socket) => {
     for (let [roomId, sockets] of rooms) {
       if (sockets.includes(socket.id)) {
         rooms.delete(roomId);
-        socket.to(roomId).emit(`chat_response/${roomId}`, JSON.stringify({
+        socket.to(roomId).emit("chat_response", JSON.stringify({
           status: "partner_disconnected",
           roomId,
           message: "Your partner left the chat."
