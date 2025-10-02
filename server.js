@@ -135,7 +135,7 @@ io.on("connection", (socket) => {
     }
 
     if (matched) {
-      const roomId = `${socket.id}-${matched.socketId}`;
+      const roomId = `${parsed.name}${random8Digit()}${matched.name}`;
       socket.join(roomId);
       const matchedSocket = getSocketById(matched.socketId);
       if (matchedSocket) matchedSocket.join(roomId);
@@ -176,6 +176,46 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ---------------- Chat Messaging ----------------
+  socket.on("chat_message", (data) => {
+    const parsed = parseClientData(data);
+    const { roomId, message, type, name, gender, time } = parsed;
+    if (!roomId || !message || !type) return;
+
+    if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
+      socket.to(roomId).emit("chat_response", JSON.stringify({
+        status: "chatting",
+        roomId,
+        from: socket.id,
+        name,
+        gender,
+        type,
+        message,
+        time
+      }));
+      console.log(`💬 ${socket.id} in ${roomId}: ${message}`);
+    } else {
+      console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
+    }
+  });
+
+  // ---------------- Leave Chat ----------------
+  socket.on("leave_chat", (data) => {
+    const parsed = parseClientData(data);
+    const { roomId } = parsed;
+    if (!roomId || !rooms.has(roomId)) return;
+
+    const otherUsers = rooms.get(roomId).filter(id => id !== socket.id);
+    otherUsers.forEach(id => {
+      const s = getSocketById(id);
+      if (s) sendToClient(s, "chat_response", { status: "partner_left", roomId, message: "Your partner left the chat." });
+    });
+
+    socket.leave(roomId);
+    rooms.delete(roomId);
+    console.log(`🚪 ${socket.id} left room ${roomId}`);
+  });
+
   // ---------------- Disconnect ----------------
   socket.on("disconnect", () => {
     console.log(`❌ User disconnected: ${socket.id}`);
@@ -189,8 +229,8 @@ io.on("connection", (socket) => {
     for (let [roomId, sockets] of rooms) {
       if (sockets.includes(socket.id)) {
         rooms.delete(roomId);
-        socket.to(roomId).emit("status", JSON.stringify({
-          state: "partner_disconnected",
+        socket.to(roomId).emit("chat_response", JSON.stringify({
+          status: "partner_disconnected",
           roomId,
           message: "Your partner left the chat."
         }));
