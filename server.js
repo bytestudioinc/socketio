@@ -84,7 +84,7 @@ function parseClientData(data) {
 
 function sendToClient(socket, event, payload) {
   try {
-    socket.emit(event, JSON.stringify(payload));
+    socket.emit(event, payload); // send as object for Kodular compatibility
   } catch (e) {
     console.warn("⚠️ sendToClient failed:", e);
   }
@@ -97,7 +97,7 @@ io.on("connection", (socket) => {
   // Notify client server is ready
   sendToClient(socket, "server_ready", { 
     state: "ready",
-    version: "1.13",
+    version: "1.16",
     reward: 1,
     preferenceCost: 10,
     maintenance: "no",
@@ -136,6 +136,13 @@ io.on("connection", (socket) => {
       if (matchedSocket) matchedSocket.join(roomId);
 
       rooms.set(roomId, [socket.id, matched.socketId]);
+
+      // Clear timeout for both users
+      if (matched._timeout) clearTimeout(matched._timeout);
+      if (parsed._timeout) clearTimeout(parsed._timeout);
+      searchingUsers.delete(socket.id);
+      searchingUsers.delete(matched.socketId);
+
       console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
 
       // Emit match found to both users
@@ -160,7 +167,6 @@ io.on("connection", (socket) => {
 
   // ---------------- Cancel Search ----------------
   socket.on("cancel_search", (data) => {
-    // We ignore data, use socket.id internally
     if (searchingUsers.has(socket.id)) {
       const user = searchingUsers.get(socket.id);
       if (user._timeout) clearTimeout(user._timeout);
@@ -177,7 +183,7 @@ io.on("connection", (socket) => {
     if (!roomId || !message || !type) return;
 
     if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
-      socket.to(roomId).emit("chat_response", JSON.stringify({
+      socket.to(roomId).emit("chat_response", {
         status: "chatting",
         roomId,
         from: socket.id,
@@ -186,7 +192,7 @@ io.on("connection", (socket) => {
         type,
         message,
         time
-      }));
+      });
       console.log(`💬 ${socket.id} in ${roomId}: ${message}`);
     } else {
       console.warn(`⚠️ ${socket.id} tried sending message to invalid room: ${roomId}`);
@@ -223,11 +229,11 @@ io.on("connection", (socket) => {
     for (let [roomId, sockets] of rooms) {
       if (sockets.includes(socket.id)) {
         rooms.delete(roomId);
-        socket.to(roomId).emit("chat_response", JSON.stringify({
+        socket.to(roomId).emit("chat_response", {
           status: "partner_disconnected",
           roomId,
           message: "Your partner left the chat."
-        }));
+        });
       }
     }
   });
