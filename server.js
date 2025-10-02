@@ -97,7 +97,7 @@ io.on("connection", (socket) => {
   // Notify client server is ready
   sendToClient(socket, "server_ready", { 
     state: "ready",
-    version: "1.16",
+    version: "1.13",
     reward: 1,
     preferenceCost: 10,
     maintenance: "no",
