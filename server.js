@@ -75,11 +75,8 @@ function parseClientData(data) {
   let parsed = {};
   try {
     if (!data) return {};
-    if (typeof data === "string") {
-      parsed = JSON.parse(data);
-    } else if (typeof data === "object") {
-      parsed = JSON.parse(JSON.stringify(data));
-    }
+    if (typeof data === "string") parsed = JSON.parse(data);
+    else if (typeof data === "object") parsed = JSON.parse(JSON.stringify(data));
   } catch (e) {
     console.warn("⚠️ parseClientData failed:", e);
   }
@@ -95,6 +92,20 @@ function sendToClient(socket, event, payload) {
   } catch (e) {
     console.warn("⚠️ sendToClient failed:", e);
   }
+}
+
+// ---------------- Emit to room safely (fix chat duplication) ----------------
+function emitToRoomOnce(roomId, event, payload) {
+  if (!rooms.has(roomId)) return;
+  const activeSockets = rooms.get(roomId).filter(id => getSocketById(id));
+  rooms.set(roomId, activeSockets); // update with only active sockets
+  activeSockets.forEach(socketId => {
+    const s = getSocketById(socketId);
+    if (s) {
+      s.emit(event, JSON.stringify(payload));
+      console.log(`📤 Emitted '${event}' to ${socketId}: ${JSON.stringify(payload)}`);
+    }
+  });
 }
 
 // ---------------- Socket.IO ----------------
@@ -113,24 +124,23 @@ io.on("connection", (socket) => {
 
   // ---------------- Find Match ----------------
   socket.on("find", (data) => {
-    let parsed = parseClientData(data);
+    const parsed = parseClientData(data);
+    console.log(`📥 Received 'find' from ${socket.id}: ${JSON.stringify(parsed)}`);
 
     parsed.socketId = socket.id;
     parsed.gender = normalizeGenderPref(parsed.gender);
     parsed.preference = normalizeGenderPref(parsed.preference);
 
-    // Remove any previous timeout for same socket
     if (searchingUsers.has(socket.id)) {
       const oldUser = searchingUsers.get(socket.id);
       if (oldUser._timeout) clearTimeout(oldUser._timeout);
     }
 
     let matched = null;
-    let paidUser = parsed.preference !== "Any";
+    const paidUser = parsed.preference !== "Any";
 
     for (let [otherId, otherUser] of searchingUsers) {
       if (otherId === socket.id) continue;
-
       const otherPaid = otherUser.preference !== "Any";
       const genderMatch = parsed.preference === "Any" || parsed.preference === otherUser.gender;
       const reverseMatch = otherUser.preference === "Any" || otherUser.preference === parsed.gender;
@@ -150,13 +160,11 @@ io.on("connection", (socket) => {
       rooms.set(roomId, [socket.id, matched.socketId]);
       console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
 
-      // Clear timeouts
       if (parsed._timeout) clearTimeout(parsed._timeout);
       if (matched._timeout) clearTimeout(matched._timeout);
       searchingUsers.delete(socket.id);
       searchingUsers.delete(matched.socketId);
 
-      // Delay emit to ensure both sockets joined
       setTimeout(() => {
         sendToClient(socket, "status", {
           state: "match_found",
@@ -169,9 +177,7 @@ io.on("connection", (socket) => {
           partner: getSafeUser(parsed)
         });
       }, 100);
-
     } else {
-      // Set timeout for searching user
       const timeout = setTimeout(() => {
         if (searchingUsers.has(socket.id)) {
           const msgPool = parsed.preference === "Any" ? timeoutMessagesFree : timeoutMessagesPaid;
@@ -216,9 +222,7 @@ io.on("connection", (socket) => {
         message,
         time
       };
-      // emit only once per message to active sockets
-      io.to(roomId).emit("chat_response", JSON.stringify(payload));
-      console.log(`💬 Broadcast in ${roomId} from ${socket.id}: ${message}`);
+      emitToRoomOnce(roomId, "chat_response", payload);
     } else {
       console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
     }
@@ -255,10 +259,9 @@ io.on("connection", (socket) => {
       searchingUsers.delete(socket.id);
     }
 
-    // Remove from rooms safely
     for (let [roomId, sockets] of rooms) {
       if (sockets.includes(socket.id)) {
-        rooms.set(roomId, sockets.filter(id => id !== socket.id));
+        rooms.set(roomId, sockets.filter(id => getSocketById(id)));
         socket.to(roomId).emit("chat_response", JSON.stringify({
           status: "partner_left",
           roomId,
