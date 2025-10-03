@@ -99,14 +99,10 @@ function sendToClient(socket, event, payload) {
 function emitToRoomOnce(roomId, event, payload) {
   if (!rooms.has(roomId)) return;
   
-  // Get the room members directly from Socket.IO's room adapter
-  const room = io.sockets.adapter.rooms.get(roomId);
-  if (!room) return;
+  const activeSockets = rooms.get(roomId).filter(id => getSocketById(id));
+  rooms.set(roomId, activeSockets); // update with only active sockets
   
-  const roomMembers = Array.from(room);
-  
-  // Send to each member in the room
-  roomMembers.forEach(socketId => {
+  activeSockets.forEach(socketId => {
     const targetSocket = getSocketById(socketId);
     if (targetSocket) {
       targetSocket.emit(event, JSON.stringify(payload));
@@ -131,6 +127,27 @@ function cleanSocketFromAllRooms(socketId) {
       }
     }
   }
+}
+
+// ---------------- Check if socket is in room (version compatible) ----------------
+function isSocketInRoom(socketId, roomId) {
+  const socket = getSocketById(socketId);
+  if (!socket) return false;
+  
+  // For newer Socket.IO versions
+  if (io.sockets.adapter.rooms) {
+    const room = io.sockets.adapter.rooms.get(roomId);
+    if (room) {
+      return room.has(socketId);
+    }
+  }
+  
+  // Fallback: check our rooms map
+  if (rooms.has(roomId)) {
+    return rooms.get(roomId).includes(socketId);
+  }
+  
+  return false;
 }
 
 // ---------------- Socket.IO ----------------
@@ -244,9 +261,8 @@ io.on("connection", (socket) => {
     const { roomId, message, type, name, gender, time } = parsed;
     if (!roomId || !message || !type) return;
 
-    // Verify socket is still in room
-    const room = io.sockets.adapter.rooms.get(roomId);
-    if (room && room.has(socket.id)) {
+    // Verify socket is in room (using our version-compatible function)
+    if (isSocketInRoom(socket.id, roomId)) {
       const payload = {
         status: "chatting",
         roomId,
@@ -258,8 +274,8 @@ io.on("connection", (socket) => {
         time
       };
       
-      // Emit to room (everyone in the room gets the message)
-      io.to(roomId).emit("chat_response", JSON.stringify(payload));
+      // Use our safe emit function
+      emitToRoomOnce(roomId, "chat_response", payload);
       console.log(`💬 Message sent in room ${roomId}: ${message}`);
     } else {
       console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
