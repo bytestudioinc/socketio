@@ -63,7 +63,7 @@ function getSafeUser(user) {
     name: user.name,
     gender: user.gender,
     preference: user.preference,
-    userId: user.socketId // Add userId (socketId)
+    userId: user.userId || user.socketId // Use userId if provided, fallback to socketId
   };
 }
 
@@ -129,17 +129,21 @@ function cleanSocketFromAllRooms(socketId) {
   }
 }
 
-// ---------------- Check if socket is in room (version compatible) ----------------
+// ---------------- Check if socket is in room (FIXED - handles missing get method) ----------------
 function isSocketInRoom(socketId, roomId) {
   const socket = getSocketById(socketId);
   if (!socket) return false;
   
   // For newer Socket.IO versions
-  if (io.sockets.adapter.rooms) {
+  if (io.sockets.adapter.rooms && typeof io.sockets.adapter.rooms.get === 'function') {
     const room = io.sockets.adapter.rooms.get(roomId);
     if (room) {
       return room.has(socketId);
     }
+  }
+  // For older Socket.IO versions or if get method doesn't exist
+  else if (io.sockets.adapter.rooms && io.sockets.adapter.rooms[roomId]) {
+    return io.sockets.adapter.rooms[roomId].sockets.hasOwnProperty(socketId);
   }
   
   // Fallback: check our rooms map
@@ -172,6 +176,8 @@ io.on("connection", (socket) => {
     parsed.socketId = socket.id;
     parsed.gender = normalizeGenderPref(parsed.gender);
     parsed.preference = normalizeGenderPref(parsed.preference);
+    // Store userId from client data if provided
+    parsed.userId = parsed.userId || socket.id;
 
     if (searchingUsers.has(socket.id)) {
       const oldUser = searchingUsers.get(socket.id);
