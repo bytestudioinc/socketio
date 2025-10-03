@@ -25,21 +25,21 @@ let rooms = new Map();          // roomId -> [socketIds]
 // ---------------- Timeout Messages ----------------
 const timeoutMessagesPaid = [
   "Oops, your match is busy. Try again!",
-  "Someone’s chatting, but you’ll get your turn. Try again!",
+  "Someone's chatting, but you'll get your turn. Try again!",
   "Patience, young grasshopper, the match awaits. Try again!",
   "Love is in the air… just not for you yet. Try again!",
   "Good things take time—your match is worth it. Try again!",
   "Your preferred partner is currently away. Try again!",
   "Looks like Cupid is tied up. Try again!",
-  "They’re busy charming someone else. Try again!"
+  "They're busy charming someone else. Try again!"
 ];
 const timeoutMessagesFree = [
-  "Everyone’s chatting. Hang tight, try again!",
+  "Everyone's chatting. Hang tight, try again!",
   "No freebirds available. Retry shortly!",
   "All ears are busy. Give it another try!",
   "Cupid is taking a nap. Try again soon!",
   "Good chats come to those who wait. Try again!",
-  "Looks like everyone’s talking. Try again!",
+  "Looks like everyone's talking. Try again!",
   "No one is free right now. Try again!",
   "All your potential partners are busy. Try again!"
 ];
@@ -62,7 +62,8 @@ function getSafeUser(user) {
   return {
     name: user.name,
     gender: user.gender,
-    preference: user.preference
+    preference: user.preference,
+    userId: user.socketId // Add userId (socketId)
   };
 }
 
@@ -94,18 +95,42 @@ function sendToClient(socket, event, payload) {
   }
 }
 
-// ---------------- Emit to room safely (fix chat duplication) ----------------
+// ---------------- Emit to room safely (fixed duplication) ----------------
 function emitToRoomOnce(roomId, event, payload) {
   if (!rooms.has(roomId)) return;
-  const activeSockets = rooms.get(roomId).filter(id => getSocketById(id));
-  rooms.set(roomId, activeSockets); // update with only active sockets
-  activeSockets.forEach(socketId => {
-    const s = getSocketById(socketId);
-    if (s) {
-      s.emit(event, JSON.stringify(payload));
+  
+  // Get the room members directly from Socket.IO's room adapter
+  const room = io.sockets.adapter.rooms.get(roomId);
+  if (!room) return;
+  
+  const roomMembers = Array.from(room);
+  
+  // Send to each member in the room
+  roomMembers.forEach(socketId => {
+    const targetSocket = getSocketById(socketId);
+    if (targetSocket) {
+      targetSocket.emit(event, JSON.stringify(payload));
       console.log(`📤 Emitted '${event}' to ${socketId}: ${JSON.stringify(payload)}`);
     }
   });
+}
+
+// ---------------- Clean socket from all rooms ----------------
+function cleanSocketFromAllRooms(socketId) {
+  for (let [existingRoomId, sockets] of rooms) {
+    if (sockets.includes(socketId)) {
+      const socket = getSocketById(socketId);
+      if (socket) {
+        socket.leave(existingRoomId);
+      }
+      const updatedSockets = sockets.filter(id => id !== socketId);
+      if (updatedSockets.length === 0) {
+        rooms.delete(existingRoomId);
+      } else {
+        rooms.set(existingRoomId, updatedSockets);
+      }
+    }
+  }
 }
 
 // ---------------- Socket.IO ----------------
@@ -153,9 +178,17 @@ io.on("connection", (socket) => {
 
     if (matched) {
       const roomId = `${parsed.name}${random8Digit()}${matched.name}`;
+      
+      // Clean up both sockets from any previous rooms
+      cleanSocketFromAllRooms(socket.id);
+      cleanSocketFromAllRooms(matched.socketId);
+      
+      // Join the new room
       socket.join(roomId);
       const matchedSocket = getSocketById(matched.socketId);
-      if (matchedSocket) matchedSocket.join(roomId);
+      if (matchedSocket) {
+        matchedSocket.join(roomId);
+      }
 
       rooms.set(roomId, [socket.id, matched.socketId]);
       console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
@@ -211,7 +244,9 @@ io.on("connection", (socket) => {
     const { roomId, message, type, name, gender, time } = parsed;
     if (!roomId || !message || !type) return;
 
-    if (rooms.has(roomId) && rooms.get(roomId).includes(socket.id)) {
+    // Verify socket is still in room
+    const room = io.sockets.adapter.rooms.get(roomId);
+    if (room && room.has(socket.id)) {
       const payload = {
         status: "chatting",
         roomId,
@@ -222,7 +257,10 @@ io.on("connection", (socket) => {
         message,
         time
       };
-      emitToRoomOnce(roomId, "chat_response", payload);
+      
+      // Emit to room (everyone in the room gets the message)
+      io.to(roomId).emit("chat_response", JSON.stringify(payload));
+      console.log(`💬 Message sent in room ${roomId}: ${message}`);
     } else {
       console.warn(`⚠️ ${socket.id} tried to send message to invalid room: ${roomId}`);
     }
@@ -261,15 +299,31 @@ io.on("connection", (socket) => {
 
     for (let [roomId, sockets] of rooms) {
       if (sockets.includes(socket.id)) {
-        rooms.set(roomId, sockets.filter(id => getSocketById(id)));
-        socket.to(roomId).emit("chat_response", JSON.stringify({
-          status: "partner_left",
-          roomId,
-          message: "Your partner left the chat."
-        }));
+        const otherUsers = sockets.filter(id => id !== socket.id);
+        
+        // Notify other users
+        otherUsers.forEach(otherId => {
+          const s = getSocketById(otherId);
+          if (s) {
+            sendToClient(s, "chat_response", {
+              status: "partner_left",
+              roomId,
+              message: "Your partner left the chat."
+            });
+          }
+        });
+
+        // Leave room and update room list
+        socket.leave(roomId);
+        const updatedSockets = sockets.filter(id => getSocketById(id) && id !== socket.id);
+        if (updatedSockets.length === 0) {
+          rooms.delete(roomId);
+        } else {
+          rooms.set(roomId, updatedSockets);
+        }
+        
         console.log(`🚪 ${socket.id} disconnected from ${roomId}`);
       }
-      if (rooms.get(roomId).length === 0) rooms.delete(roomId);
     }
   });
 });
