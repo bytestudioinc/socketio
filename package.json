@@ -1,18 +1,16 @@
 {
-  "name": "niotron-socket.io",
+  "name": "random-chat-server",
   "version": "1.0.0",
-  "description": "Sample code to use Socket.io Component of Niotron Builder.",
+  "description": "Socket.io v4 Server for Random Chat",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "author": "Your Name",
-  "license": "ISC",
   "dependencies": {
-    "express": "^4.17.1",
-    "socket.io": "^2.3.0"
+    "express": "^4.18.2",
+    "socket.io": "^4.7.4"
   },
   "engines": {
-    "node": ">=12.0.0"
+    "node": ">=16.0.0"
   }
 }
