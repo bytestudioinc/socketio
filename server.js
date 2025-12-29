@@ -138,8 +138,8 @@ io.on("connection", (socket) => {
   // Server ready response
   sendToClient(socket, "server_ready", {
     state: "ready",
-    version: "2.0-v4",
-    reward: 1,
+    version: "1.0.0",
+    reward: 5,
     preferenceCost: 10,
     maintenance: "no",
     url: "https://play.google.com/store/apps/details?id=com.byte.strangerchat"
