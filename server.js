@@ -1,6 +1,6 @@
 const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io"); // Strict v4 import
+const { Server } = require("socket.io"); 
 
 const app = express();
 const server = http.createServer(app);
@@ -35,283 +35,218 @@ const timeoutMessagesPaid = [
 const timeoutMessagesFree = [
   "Everyone's chatting. Hang tight, try again!",
   "No freebirds available. Retry shortly!",
-  "All ears are busy. Give it another try!",
-  "Cupid is taking a nap. Try again soon!",
-  "Good chats come to those who wait. Try again!",
-  "Looks like everyone's talking. Try again!",
-  "No one is free right now. Try again!",
-  "All your potential partners are busy. Try again!"
+  "All ears busy right now. Try again!",
+  "The chatroom is packed! Try again!",
+  "Looks like a full house. Try again!",
+  "Popular time! No match found yet. Try again!",
+  "Searching for a signal… none found. Try again!",
+  "Quiet on the line. Try again!"
 ];
 
 // ---------------- Helper Functions ----------------
-function normalizeGenderPref(value) {
-  if (!value) return "Any";
-  value = value.toString().toUpperCase();
-  if (["M", "MALE"].includes(value)) return "Male";
-  if (["F", "FEMALE"].includes(value)) return "Female";
-  if (["A", "ANY"].includes(value)) return "Any";
-  return "Any";
+function getRandomMessage(type) {
+  const messages = type === "paid" ? timeoutMessagesPaid : timeoutMessagesFree;
+  return messages[Math.floor(Math.random() * messages.length)];
 }
 
-function random8Digit() {
-  return Math.floor(10000000 + Math.random() * 90000000).toString();
-}
+function findMatch(socket, userData) {
+  const { gender, preference } = userData;
+  const isPaid = preference !== "any"; 
 
-function getSafeUser(user) {
-  return {
-    name: user.name,
-    gender: user.gender,
-    preference: user.preference,
-    userId: user.userId || user.socketId
-  };
-}
+  // Look for a partner in the queue
+  for (let [partnerId, partnerData] of searchingUsers) {
+    if (partnerId === socket.id) continue; // Skip self
 
-// v4: Get socket instance
-function getSocketById(socketId) {
-  return io.sockets.sockets.get(socketId);
-}
+    // Check matching criteria
+    // 1. My preference matches their gender?
+    const matchMyPref = (preference === "any") || (preference === partnerData.gender.toLowerCase());
+    // 2. Their preference matches my gender?
+    const matchTheirPref = (partnerData.preference === "any") || (partnerData.preference === gender.toLowerCase());
 
-function parseClientData(data) {
-  let parsed = {};
-  try {
-    if (!data) return {};
-    if (typeof data === "string") parsed = JSON.parse(data);
-    else if (typeof data === "object") parsed = JSON.parse(JSON.stringify(data));
-  } catch (e) {
-    console.warn("⚠️ parseClientData failed:", e);
-  }
-  return parsed;
-}
-
-function sendToClient(socket, event, payload) {
-  try {
-    if (!socket) return;
-    const str = JSON.stringify(payload); // We keep sending strings as per your client logic
-    socket.emit(event, str);
-    console.log(`📤 Sent '${event}' to ${socket.id}`);
-  } catch (e) {
-    console.warn("⚠️ sendToClient failed:", e);
-  }
-}
-
-// ---------------- Emit to room (Strict v4) ----------------
-function emitToRoomOnce(roomId, event, payload) {
-  // v4: io.to(roomId).emit(...) broadcasts to everyone in the room automatically
-  // But since your client expects a JSON string, we stringify first.
-  const str = JSON.stringify(payload);
-  io.to(roomId).emit(event, str);
-  console.log(`📤 Broadcast '${event}' to room ${roomId}`);
-}
-
-// ---------------- Clean socket from all rooms ----------------
-function cleanSocketFromAllRooms(socketId) {
-  const socket = getSocketById(socketId);
-  if (!socket) return;
-
-  // v4: socket.rooms is a Set containing the socketId itself + rooms
-  socket.rooms.forEach(room => {
-    if (room !== socketId) {
-      socket.leave(room);
-    }
-  });
-  
-  // Cleanup our internal map
-  for (let [rid, members] of rooms) {
-    if (members.includes(socketId)) {
-        const newMembers = members.filter(id => id !== socketId);
-        if (newMembers.length === 0) rooms.delete(rid);
-        else rooms.set(rid, newMembers);
-    }
-  }
-}
-
-function isSocketInRoom(socketId, roomId) {
-  const socket = getSocketById(socketId);
-  if (!socket) return false;
-  return socket.rooms.has(roomId);
-}
-
-// ---------------- Socket.IO Logic ----------------
-io.on("connection", (socket) => {
-  console.log(`✅ User connected: ${socket.id}`);
-
-  // Server ready response
-  sendToClient(socket, "server_ready", {
-    state: "ready",
-    version: "1.0.0",
-    reward: 5,
-    preferenceCost: 10,
-    maintenance: "no",
-    url: "https://play.google.com/store/apps/details?id=com.byte.strangerchat"
-  });
-
-  // ---------------- Find Match ----------------
-  socket.on("find", (data) => {
-    const parsed = parseClientData(data);
-    console.log(`📥 Received 'find' from ${socket.id}`);
-
-    parsed.socketId = socket.id;
-    parsed.gender = normalizeGenderPref(parsed.gender);
-    parsed.preference = normalizeGenderPref(parsed.preference);
-    parsed.userId = parsed.userId || socket.id;
-
-    if (searchingUsers.has(socket.id)) {
-      const oldUser = searchingUsers.get(socket.id);
-      if (oldUser._timeout) clearTimeout(oldUser._timeout);
-    }
-
-    let matched = null;
-    const paidUser = parsed.preference !== "Any";
-
-    // Matchmaking Algorithm
-    for (let [otherId, otherUser] of searchingUsers) {
-      if (otherId === socket.id) continue;
-      
-      const otherPaid = otherUser.preference !== "Any";
-      const genderMatch = parsed.preference === "Any" || parsed.preference === otherUser.gender;
-      const reverseMatch = otherUser.preference === "Any" || otherUser.preference === parsed.gender;
-
-      if (genderMatch && reverseMatch) {
-        if (paidUser && otherPaid) { matched = otherUser; break; } // Prioritize double-paid
-        if (!matched) matched = otherUser;
-      }
-    }
-
-    if (matched) {
-      const roomId = `${parsed.name}${random8Digit()}${matched.name}`;
-      
-      // Cleanup previous rooms
-      cleanSocketFromAllRooms(socket.id);
-      cleanSocketFromAllRooms(matched.socketId);
-      
-      // Join Room
-      socket.join(roomId);
-      const matchedSocket = getSocketById(matched.socketId);
-      if (matchedSocket) matchedSocket.join(roomId);
-
-      rooms.set(roomId, [socket.id, matched.socketId]);
-      console.log(`🎯 Match: ${socket.id} + ${matched.socketId} in room ${roomId}`);
-
-      // Clear Timeouts
-      if (parsed._timeout) clearTimeout(parsed._timeout);
-      if (matched._timeout) clearTimeout(matched._timeout);
-      
+    if (matchMyPref && matchTheirPref) {
+      // --- MATCH FOUND ---
       searchingUsers.delete(socket.id);
-      searchingUsers.delete(matched.socketId);
+      searchingUsers.delete(partnerId);
 
-      // Notify Clients
-      setTimeout(() => {
-        sendToClient(socket, "status", {
+      // Create a unique room ID
+      const roomId = `${socket.id}#${partnerId}`;
+      
+      // Join both sockets to the room
+      const partnerSocket = io.sockets.sockets.get(partnerId);
+      if (partnerSocket) {
+        socket.join(roomId);
+        partnerSocket.join(roomId);
+        
+        rooms.set(roomId, [socket.id, partnerId]);
+
+        // Notify User A (Current Socket)
+        socket.emit("status", JSON.stringify({
+          status: "match_found",
+          state: "match_found", // Redundant for client compatibility
+          roomId,
+          partnerId: partnerId,
+          partnerName: partnerData.name,
+          partnerGender: partnerData.gender,
+          partner: { // Nested object for client compatibility
+             name: partnerData.name,
+             gender: partnerData.gender,
+             userId: partnerId
+          }
+        }));
+
+        // Notify User B (Partner)
+        partnerSocket.emit("status", JSON.stringify({
+          status: "match_found",
           state: "match_found",
           roomId,
-          partner: getSafeUser(matched)
-        });
-        if (matchedSocket) {
-          sendToClient(matchedSocket, "status", {
-            state: "match_found",
-            roomId,
-            partner: getSafeUser(parsed)
-          });
-        }
-      }, 100);
+          partnerId: socket.id,
+          partnerName: userData.name,
+          partnerGender: userData.gender,
+          partner: {
+             name: userData.name,
+             gender: userData.gender,
+             userId: socket.id
+          }
+        }));
 
-    } else {
-      // No Match Found - Add to Queue
-      const timeout = setTimeout(() => {
-        if (searchingUsers.has(socket.id)) {
-          const msgPool = parsed.preference === "Any" ? timeoutMessagesFree : timeoutMessagesPaid;
-          const randomMsg = msgPool[Math.floor(Math.random() * msgPool.length)];
-          sendToClient(socket, "status", { state: "timeout", message: randomMsg });
-          searchingUsers.delete(socket.id);
-        }
-      }, 30000);
-
-      parsed._timeout = timeout;
-      searchingUsers.set(socket.id, parsed);
-      sendToClient(socket, "status", { state: "searching", message: "Searching for a partner..." });
+        console.log(`✅ Match: ${userData.name} <-> ${partnerData.name} in room ${roomId}`);
+        return true;
+      }
     }
-  });
+  }
+  return false;
+}
 
-  // ---------------- Cancel Search ----------------
-  socket.on("cancel_search", () => {
+// ---------------- Socket Events ----------------
+io.on("connection", (socket) => {
+  console.log(`🔌 Connected: ${socket.id}`);
+
+  // 1. Find Match
+  socket.on("find", (data) => {
+    // data: { name, gender, preference }
+    console.log(`🔍 Search request from ${socket.id}:`, data);
+
+    // If already searching, remove old entry first
     if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
+      clearTimeout(searchingUsers.get(socket.id)._timeout);
       searchingUsers.delete(socket.id);
-      sendToClient(socket, "status", { state: "cancelled", message: "Search cancelled." });
+    }
+
+    const userData = { ...data, socketId: socket.id };
+
+    // Try to match immediately
+    const matched = findMatch(socket, userData);
+
+    if (!matched) {
+      // Add to queue with timeout
+      userData._timeout = setTimeout(() => {
+        if (searchingUsers.has(socket.id)) {
+          searchingUsers.delete(socket.id);
+          const msg = getRandomMessage(data.preference !== "any" ? "paid" : "free");
+          socket.emit("status", JSON.stringify({ status: "timeout", state: "timeout", message: msg }));
+        }
+      }, 30000); // 30s timeout
+
+      searchingUsers.set(socket.id, userData);
+      socket.emit("status", JSON.stringify({ status: "searching", state: "searching", message: "Searching for a partner..." }));
     }
   });
 
-  // ---------------- Chat Messaging ----------------
+  // 2. Chat Message
   socket.on("chat_message", (data) => {
-    const parsed = parseClientData(data);
-    const { roomId, message, type, name, gender, time } = parsed;
-    
-    if (roomId && isSocketInRoom(socket.id, roomId)) {
-      emitToRoomOnce(roomId, "chat_response", {
-        status: "chatting",
-        roomId,
-        from: socket.id, // Client uses this to distinguish own vs partner message
-        name,
-        gender,
-        type,
-        message,
-        time
-      });
+    // data: { roomId, content, type (optional), ... }
+    const { roomId, content } = data;
+    if (roomId && rooms.has(roomId)) {
+      // Broadcast to everyone in the room (including sender, for confirmation/sync if needed)
+      // Usually better to use socket.to(roomId) to send to partner, 
+      // but io.to(roomId) ensures order consistency for both.
+      io.to(roomId).emit("chat_response", JSON.stringify({
+        ...data,
+        from: socket.id, // Sender ID
+        timestamp: new Date().toISOString()
+      }));
     }
   });
 
-  // ---------------- Leave Chat ----------------
-  socket.on("leave_chat", (data) => {
-    const parsed = parseClientData(data);
-    const { roomId } = parsed;
+  // 3. Typing Events
+  socket.on("typing", (data) => {
+    const { roomId } = data;
+    if (roomId) {
+      // Send to everyone else in the room
+      socket.to(roomId).emit("typing", { from: socket.id });
+    }
+  });
 
+  socket.on("stop_typing", (data) => {
+    const { roomId } = data;
+    if (roomId) {
+      socket.to(roomId).emit("stop_typing", { from: socket.id });
+    }
+  });
+
+  // 4. Leave Chat (Manual)
+  socket.on("leave_chat", (data) => {
+    const roomId = data?.roomId;
     if (roomId && rooms.has(roomId)) {
-      // Notify others in the room BEFORE destroying it
-      io.to(roomId).emit("chat_response", JSON.stringify({
+      // Notify partner
+      socket.to(roomId).emit("chat_response", JSON.stringify({
         status: "partner_left",
+        state: "partner_left",
         roomId,
         message: "Your partner left the chat."
       }));
 
-      // Make everyone leave
       io.in(roomId).socketsLeave(roomId);
       rooms.delete(roomId);
+    } else {
+        // Fallback: If no roomId provided, try to find room this socket is in
+        for (let [rId, members] of rooms) {
+            if (members.includes(socket.id)) {
+                socket.to(rId).emit("chat_response", JSON.stringify({
+                    status: "partner_left",
+                    state: "partner_left",
+                    message: "Your partner left."
+                }));
+                io.in(rId).socketsLeave(rId);
+                rooms.delete(rId);
+                break;
+            }
+        }
+    }
+    
+    // Also remove from queue if they were searching
+    if (searchingUsers.has(socket.id)) {
+        clearTimeout(searchingUsers.get(socket.id)._timeout);
+        searchingUsers.delete(socket.id);
     }
   });
 
-  // ---------------- Disconnect ----------------
+  // 5. Disconnect
   socket.on("disconnect", () => {
-    console.log(`❌ User disconnected: ${socket.id}`);
+    console.log(`❌ Disconnected: ${socket.id}`);
 
-    // Remove from search queue
+    // Remove from search
     if (searchingUsers.has(socket.id)) {
-      const user = searchingUsers.get(socket.id);
-      if (user._timeout) clearTimeout(user._timeout);
+      clearTimeout(searchingUsers.get(socket.id)._timeout);
       searchingUsers.delete(socket.id);
     }
 
-    // Handle active chats
-    // v4: We don't need to manually iterate rooms for this socket, 
-    // but our 'rooms' Map needs to be kept in sync.
+    // Handle active rooms
     for (let [roomId, members] of rooms) {
       if (members.includes(socket.id)) {
-        // Notify partner
-        io.to(roomId).emit("chat_response", JSON.stringify({
+        socket.to(roomId).emit("chat_response", JSON.stringify({
           status: "partner_left",
+          state: "partner_left",
           roomId,
           message: "Your partner disconnected."
         }));
-        
-        // Cleanup room map
-        const remaining = members.filter(id => id !== socket.id);
-        if (remaining.length === 0) rooms.delete(roomId);
-        else rooms.set(roomId, remaining);
+        io.in(roomId).socketsLeave(roomId);
+        rooms.delete(roomId);
       }
     }
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
