@@ -1,6 +1,6 @@
 const express = require("express");
 const http = require("http");
-const { Server } = require("socket.io"); 
+const { Server } = require("socket.io"); // Strict v4 import
 
 const app = express();
 const server = http.createServer(app);
@@ -172,7 +172,7 @@ io.on("connection", (socket) => {
   socket.on("typing", (data) => {
     const { roomId } = data;
     if (roomId) {
-      // Send to everyone else in the room
+      // Send to partner only
       socket.to(roomId).emit("typing", { from: socket.id });
     }
   });
@@ -180,11 +180,21 @@ io.on("connection", (socket) => {
   socket.on("stop_typing", (data) => {
     const { roomId } = data;
     if (roomId) {
+      // Send to partner only
       socket.to(roomId).emit("stop_typing", { from: socket.id });
     }
   });
 
-  // 4. Leave Chat (Manual)
+  // 4. Read Receipts
+  socket.on("mark_read", (data) => {
+    const { roomId } = data;
+    if (roomId) {
+      // Notify the partner that their messages were read
+      socket.to(roomId).emit("receipt_read", { from: socket.id, timestamp: new Date().toISOString() });
+    }
+  });
+
+  // 5. Leave Chat (Manual)
   socket.on("leave_chat", (data) => {
     const roomId = data?.roomId;
     if (roomId && rooms.has(roomId)) {
@@ -221,7 +231,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 5. Disconnect
+  // 6. Disconnect
   socket.on("disconnect", () => {
     console.log(`❌ Disconnected: ${socket.id}`);
 
